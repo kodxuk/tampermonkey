@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Assyst: полное время на группе 1С Сопровождение ФТО (все интервалы, все старты)
+// @name         Assyst: полное время на группе 1С Сопровождение ФТО
 // @match        https://itsm.cherkizovsky.net/*
 // @run-at       document-end
 // @grant        none
