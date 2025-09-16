@@ -1,107 +1,217 @@
 // ==UserScript==
-// @name         Assyst: полное время на группе 1С Сопровождение ФТО
+// @name         Assyst: время на группе 1С Сопровождение ФТО (SLA, чистые интервалы)
+// @namespace    https://github.com/kodxuk/tampermonkey
+// @version      1.7.1
+// @description  Считает только время, когда тикет реально назначен на «1С Сопровождение ФТО». Интервалы обрезаются на повторном старте/переназначении/Выполнить. Сортировка по времени + устойчивая нормализация «1C/1С».
+// @author       kodx
 // @match        https://itsm.cherkizovsky.net/*
-// @run-at       document-end
 // @grant        none
+// @run-at       document-end
+// @license      MIT
 // ==/UserScript==
-(function(){
-  const GROUP = '1С Сопровождение ФТО';
-  const norm = s => String(s||'').replace(/[с]/g,'c').replace(/\s+/g,' ').replace(/ /g,'').toLowerCase().trim();
-  function parseRUDate(s){
+
+(function () {
+  // Настройки
+  const TARGET_GROUP = '1С Сопровождение ФТО';
+  const DEBUG = false; // true — подробный лог в консоль
+
+  // Нормализация строк: лат/кир «похожие» символы, неразрывные пробелы, регистр
+  function norm(s) {
+    s = String(s || '')
+      .normalize('NFKD')
+      .replace(/\u00A0/g, ' ')     // NBSP -> space
+      .trim()
+      .toLowerCase();
+
+    // Сопоставление часто встречающихся гомоглифов
+    const map = {
+      'с': 'c', 'c': 'c',
+      'о': 'o',
+      'е': 'e', 'ё': 'e',
+      'а': 'a',
+      'р': 'p',
+      'к': 'k',
+      'х': 'x',
+      'м': 'm',
+      'т': 't',
+      'у': 'y',
+      'в': 'v',
+      'н': 'h',
+      'і': 'i'
+    };
+    s = s.replace(/./g, ch => map[ch] ?? ch).replace(/\s+/g, ' ');
+    return s;
+  }
+  const TARGET_N = norm(TARGET_GROUP);
+
+  // Парсер дат DD.MM.YY(YY) HH:MM
+  function parseRUDate(s) {
     s = (typeof s === 'string') ? s : '';
     const m = s.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s+(\d{1,2}):(\d{2})/);
     if (!m) return 0;
-    let day = parseInt(m[1],10), month = parseInt(m[2],10)-1;
-    let year = m[3].length === 2 ? 2000 + parseInt(m[3],10) : parseInt(m[3],10);
-    let hour = parseInt(m[4],10), min = parseInt(m[5],10);
-    return new Date(year, month, day, hour, min).getTime();
+    const dd = +m[1], MM = +m[2] - 1;
+    const yyyy = m[3].length === 2 ? 2000 + +m[3] : +m[3];
+    const HH = +m[4], mm = +m[5];
+    return new Date(yyyy, MM, dd, HH, mm).getTime();
   }
-  function extractEvents(){
-    const grid = document.getElementById("actionGrid");
+
+  // Извлечение событий из таблицы actionGrid
+  function extractEvents() {
+    const grid = document.getElementById('actionGrid');
     if (!grid) return [];
-    const rows = Array.from(grid.querySelectorAll('tr')).filter(row => row.querySelectorAll('td').length > 7);
-    return rows.map(row => {
+    const rows = Array.from(grid.querySelectorAll('tr'))
+      .filter(r => r.querySelectorAll('td').length > 7);
+
+    const evs = rows.map(row => {
       const tds = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
-      return { tds };
+      const action = tds[2] || '';
+      const date = tds[3] || '';
+      const gExec = tds[5] || '';
+      const gAssgn = tds[7] || '';
+      const dt = parseRUDate(date);
+      return {
+        action,
+        date,
+        dt,
+        gExec,
+        gAssgn,
+        gExecN: norm(gExec),
+        gAssgnN: norm(gAssgn)
+      };
     });
+
+    // Критично: всегда считаем в хронологическом порядке
+    return evs.filter(e => e.dt > 0).sort((a, b) => a.dt - b.dt);
   }
-  function computeIntervals(events){
-    // Определяем все возможные старты (старт каждого куска)
-    const groupNorm = norm(GROUP);
-    let startList = [];
-    events.forEach((ev, i) => {
-      const tds = ev.tds;
-      if (tds[2] === "Переоткрыть") {
-        startList.push({ dt: parseRUDate(tds[3]), date: tds[3], idx: i, action: tds[2] });
-      } else if (tds[2] === "Назначить" && norm(tds[7]) === groupNorm) {
-        startList.push({ dt: parseRUDate(tds[3]), date: tds[3], idx: i, action: tds[2] });
-      } else if (tds[2] === "Принять в работу" && norm(tds[5]) === groupNorm) {
-        startList.push({ dt: parseRUDate(tds[3]), date: tds[3], idx: i, action: tds[2] });
-      }
-    });
-    // Определяем все "Выполнить" нужной группой
-    let finishList = [];
-    events.forEach((ev, i) => {
-      const tds = ev.tds;
-      if (/Выполнить|complete|resolve|close/i.test(tds[2]) && norm(tds[5]) === groupNorm) {
-        finishList.push({ dt: parseRUDate(tds[3]), date: tds[3], idx: i });
-      }
-    });
-    // Для КАЖДОГО стартового события ищем ближайшее неиспользованное "Выполнить" после него
-    let usedFinishes = {};
+
+  // Расчёт «чистых» интервалов на группе
+  function computeIntervals(events) {
+    // Старт периода ответственности нашей группы
+    const isStartOnUs = ev =>
+      ev.action === 'Переоткрыть' ||
+      (ev.action === 'Назначить' && ev.gAssgnN === TARGET_N) ||
+      (ev.action === 'Принять в работу' && ev.gExecN === TARGET_N);
+
+    // Потеря ответственности (уходит к другой группе)
+    const leftOurGroup = ev =>
+      (ev.action === 'Назначить' && ev.gAssgnN !== TARGET_N) ||
+      (ev.action === 'Принять в работу' && ev.gExecN !== TARGET_N);
+
+    // Завершение нашей группой
+    const isFinishByUs = ev =>
+      /Выполнить|complete|resolve|close/i.test(ev.action) && ev.gExecN === TARGET_N;
+
     let intervals = [];
-    startList.forEach(st => {
-      let nextFinish = finishList.find(fn => fn.dt > st.dt && !usedFinishes[fn.idx]);
-      if (nextFinish) {
-        intervals.push({
-          start: st.date,
-          end: nextFinish.date,
-          min: Math.round((nextFinish.dt - st.dt)/60000)
-        });
-        usedFinishes[nextFinish.idx] = true;
+    let inGroup = false;
+    let tStart = null;
+    let startDate = null;
+
+    for (const ev of events) {
+      if (DEBUG) console.log('EVT:', ev.date, ev.action, ev.gExec, ev.gAssgn);
+
+      // Повторный старт на нас — закрывает предыдущий интервал и открывает новый
+      if (isStartOnUs(ev)) {
+        if (inGroup && tStart !== null && ev.dt > tStart) {
+          intervals.push({
+            start: startDate,
+            end: ev.date,
+            min: Math.round((ev.dt - tStart) / 60000)
+          });
+          if (DEBUG) console.log('END by re-start:', startDate, '→', ev.date);
+        }
+        inGroup = true;
+        tStart = ev.dt;
+        startDate = ev.date;
+        if (DEBUG) console.log('START on us:', startDate);
+        continue;
       }
-    });
-    let total = intervals.reduce((s,p)=>s+p.min,0);
-    return {intervals, total};
+
+      // Переназначено/принято другой группой — обрезаем
+      if (inGroup && leftOurGroup(ev) && ev.dt > tStart) {
+        intervals.push({
+          start: startDate,
+          end: ev.date,
+          min: Math.round((ev.dt - tStart) / 60000)
+        });
+        if (DEBUG) console.log('END by leaving:', startDate, '→', ev.date, ev.gAssgn || ev.gExec);
+        inGroup = false;
+        tStart = null;
+        startDate = null;
+        continue;
+      }
+
+      // Выполнено нашей группой — обрезаем
+      if (inGroup && isFinishByUs(ev) && ev.dt > tStart) {
+        intervals.push({
+          start: startDate,
+          end: ev.date,
+          min: Math.round((ev.dt - tStart) / 60000)
+        });
+        if (DEBUG) console.log('END by finish:', startDate, '→', ev.date);
+        inGroup = false;
+        tStart = null;
+        startDate = null;
+      }
+    }
+
+    // Хвост (незавершённый период) намеренно не учитываем для SLA.
+    const total = intervals.reduce((s, p) => s + p.min, 0);
+    return { intervals, total };
   }
-  function showBadge(text){
+
+  // Плашка с итогом
+  function showBadge(text) {
     let el = document.getElementById('assyst-time-badge');
     if (!el) {
       el = document.createElement('div');
       el.id = 'assyst-time-badge';
       Object.assign(el.style, {
-        position:'fixed',right:'16px',top:'16px',zIndex:999999,
-        background:'rgba(20,20,20,.92)',color:'#fff',padding:'8px 12px',
-        font:'12px/1.3 -apple-system,Segoe UI,Roboto',borderRadius:'8px',pointerEvents:'none'
+        position: 'fixed',
+        right: '16px',
+        top: '16px',
+        zIndex: 999999,
+        background: 'rgba(20,20,20,.92)',
+        color: '#fff',
+        padding: '8px 12px',
+        font: '12px/1.3 -apple-system,Segoe UI,Roboto',
+        borderRadius: '8px',
+        pointerEvents: 'none'
       });
       document.documentElement.appendChild(el);
     }
     el.textContent = text;
   }
-  function main(){
+
+  function main() {
     const events = extractEvents();
-    const result = computeIntervals(events);
-    let msg = `Время на группе «${GROUP}»: ${Math.floor(result.total/60)} ч ${result.total%60} мин`;
-    if(result.intervals.length > 1){
-      msg += `  (интервалов: ${result.intervals.length})`;
-    }
+    const { intervals, total } = computeIntervals(events);
+
+    // Итог
+    let msg = `Время на группе «${TARGET_GROUP}»: ${Math.floor(total / 60)} ч ${total % 60} мин`;
+    if (intervals.length > 1) msg += `  (интервалов: ${intervals.length})`;
     showBadge(msg);
-    // Для аудита:
-    // result.intervals.forEach((p,i)=>console.log(`#${i+1}: ${p.start} — ${p.end} = ${p.min} мин`));
+
+    if (DEBUG) {
+      console.log('— Итоговые интервалы —');
+      intervals.forEach((p, i) => console.log(`#${i + 1}: ${p.start} — ${p.end} = ${p.min} мин`));
+    }
   }
-  function readyLoop(){
-    if(document.getElementById("actionGrid")){
+
+  function readyLoop() {
+    if (document.getElementById('actionGrid')) {
       main();
       const mo = new MutationObserver(main);
-      mo.observe(document.getElementById("actionGrid"),{childList:true,subtree:true});
-    }else{
-      setTimeout(readyLoop,400);
+      mo.observe(document.getElementById('actionGrid'), { childList: true, subtree: true });
+    } else {
+      setTimeout(readyLoop, 400);
     }
   }
-  const p=history.pushState,r=history.replaceState;
-  history.pushState=function(){const o=p.apply(this,arguments);window.dispatchEvent(new Event('assyst-route'));return o;};
-  history.replaceState=function(){const o=r.apply(this,arguments);window.dispatchEvent(new Event('assyst-route'));return o;};
-  window.addEventListener('popstate',()=>window.dispatchEvent(new Event('assyst-route')));
-  window.addEventListener('assyst-route',()=>readyLoop());
+
+  // Реакция на SPA-навигацию Assyst
+  const p = history.pushState, r = history.replaceState;
+  history.pushState = function () { const o = p.apply(this, arguments); window.dispatchEvent(new Event('assyst-route')); return o; };
+  history.replaceState = function () { const o = r.apply(this, arguments); window.dispatchEvent(new Event('assyst-route')); return o; };
+  window.addEventListener('popstate', () => window.dispatchEvent(new Event('assyst-route')));
+  window.addEventListener('assyst-route', () => readyLoop());
   readyLoop();
 })();
