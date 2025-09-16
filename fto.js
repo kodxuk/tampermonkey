@@ -1,16 +1,8 @@
 // ==UserScript==
-// @name         Assyst: время на группе 1С Сопровождение ФТО (все интервалы, v1.0)
-// @namespace    https://github.com/kodxuk/tampermonkey/edit/main/fto
-// @version      1.0
-// @description  Подсчёт суммарного времени всех рабочих "кусков" на группе "1С Сопровождение ФТО" в Assyst (Назначить, Принять в работу, Переоткрыть → Выполнить).
-// @author       YourName
+// @name         Assyst: полное время на группе 1С Сопровождение ФТО (все интервалы, все старты)
 // @match        https://itsm.cherkizovsky.net/*
-// @icon         https://www.svgrepo.com/show/375753/clock.svg
-// @grant        none
 // @run-at       document-end
-// @license      MIT
-// @homepageURL  https://github.com/yourusername/assyst-fto-timer
-// @supportURL   https://github.com/yourusername/assyst-fto-timer/issues
+// @grant        none
 // ==/UserScript==
 (function(){
   const GROUP = '1С Сопровождение ФТО';
