@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Assyst: время на группе 1С Сопровождение ФТО (SLA, чистые интервалы)
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.8.0
-// @description  Считает только время, когда тикет реально назначен на «1С Сопровождение ФТО». Интервалы обрезаются на повторном старте/переназначении/Выполнить. Поддерживает подгруппы (Администраторы). Сортировка по времени + устойчивая нормализация «1C/1С».
+// @version      1.8.1
+// @description  Считает только время, когда тикет реально назначен на «1С Сопровождение ФТО». Интервалы обрезаются на повторном старте/переназначении/Выполнить. Поддерживает подгруппы (Администраторы) и hash-навигацию.
 // @author       kodx
 // @match        https://itsm.cherkizovsky.net/*
+// @match        https://itsm/assystweb/*
+// @all-frames   true
 // @grant        none
 // @run-at       document-end
 // @license      MIT
@@ -13,17 +15,16 @@
 (function () {
     // Настройки
     const TARGET_GROUP = '1С Сопровождение ФТО';
-    const DEBUG = true; // true — подробный лог в консоль
+    const DEBUG = true; // подробный лог в консоль
 
-    // Нормализация строк: лат/кир «похожие» символы, неразрывные пробелы, регистр
+    // Нормализация строк: лат/кир «похожие» символы, NBSP, регистр
     function norm(s) {
         s = String(s || '')
             .normalize('NFKD')
-            .replace(/\u00A0/g, ' ') // NBSP -> space
+            .replace(/\u00A0/g, ' ')
             .trim()
             .toLowerCase();
 
-        // Сопоставление часто встречающихся гомоглифов
         const map = {
             'с': 'c', 'c': 'c',
             'о': 'o',
@@ -45,71 +46,59 @@
     }
 
     const TARGET_N = norm(TARGET_GROUP);
-
-    // Проверка, является ли группа "нашей" (включая подгруппы)
-    function isOur(groupName) {
-        return norm(groupName).startsWith(TARGET_N);
-    }
+    const isOur = g => norm(g).startsWith(TARGET_N); // допускаем подгруппы
 
     // Парсер дат DD.MM.YY(YY) HH:MM
     function parseRUDate(s) {
         s = (typeof s === 'string') ? s : '';
         const m = s.match(/(\d{2})\.(\d{2})\.(\d{2,4})\s+(\d{1,2}):(\d{2})/);
         if (!m) return 0;
-
         const dd = +m[1], MM = +m[2] - 1;
         const yyyy = m[3].length === 2 ? 2000 + +m[3] : +m[3];
         const HH = +m[4], mm = +m[5];
-
         return new Date(yyyy, MM, dd, HH, mm).getTime();
     }
 
-    // Извлечение событий из таблицы actionGrid
+    // Извлечение событий из таблицы истории
     function extractEvents() {
-        const grid = document.getElementById('actionGrid');
+        // Основной id используется в обеих версиях интерфейса
+        let grid = document.getElementById('actionGrid');
+
+        // Фоллбек: ищем таблицу с достаточным числом столбцов
+        if (!grid) {
+            const cand = Array.from(document.querySelectorAll('table'))
+                .find(t => t.id?.includes('action') || t.textContent.includes('История выполненных действий'));
+            if (cand) grid = cand;
+        }
         if (!grid) return [];
 
         const rows = Array.from(grid.querySelectorAll('tr'))
-            .filter(r => r.querySelectorAll('td').length > 7);
+            .filter(r => r.querySelectorAll('td').length >= 8);
 
         const evs = rows.map(row => {
             const tds = Array.from(row.querySelectorAll('td')).map(td => td.textContent.trim());
-
             const action = tds[2] || '';
             const date = tds[3] || '';
             const gExec = tds[5] || '';
             const gAssgn = tds[7] || '';
             const dt = parseRUDate(date);
-
-            return {
-                action,
-                date,
-                dt,
-                gExec,
-                gAssgn,
-                gExecN: norm(gExec),
-                gAssgnN: norm(gAssgn)
-            };
+            return { action, date, dt, gExec, gAssgn };
         });
 
-        // Критично: всегда считаем в хронологическом порядке
         return evs.filter(e => e.dt > 0).sort((a, b) => a.dt - b.dt);
     }
 
-    // Расчёт «чистых» интервалов на группе
+    // Расчёт «чистых» интервалов на нашей группе
     function computeIntervals(events) {
-        // Старт периода ответственности нашей группы (включая подгруппы)
         const isStartOnUs = ev =>
             ev.action === 'Переоткрыть' ||
             (ev.action === 'Назначить' && isOur(ev.gAssgn)) ||
             (ev.action === 'Принять в работу' && isOur(ev.gExec));
 
-        // Потеря ответственности (уходит к группе, НЕ являющейся нашей подгруппой)
         const leftOurGroup = ev =>
             (ev.action === 'Назначить' && !isOur(ev.gAssgn)) ||
             (ev.action === 'Принять в работу' && !isOur(ev.gExec));
 
-        // Завершение нашей группой (включая подгруппы)
         const isFinishByUs = ev =>
             /Выполнить|complete|resolve|close/i.test(ev.action) && isOur(ev.gExec);
 
@@ -121,17 +110,11 @@
         for (const ev of events) {
             if (DEBUG) console.log('EVT:', ev.date, ev.action, ev.gExec, ev.gAssgn);
 
-            // Повторный старт на нас — закрывает предыдущий интервал и открывает новый
             if (isStartOnUs(ev)) {
                 if (inGroup && tStart !== null && ev.dt > tStart) {
-                    intervals.push({
-                        start: startDate,
-                        end: ev.date,
-                        min: Math.round((ev.dt - tStart) / 60000)
-                    });
+                    intervals.push({ start: startDate, end: ev.date, min: Math.round((ev.dt - tStart) / 60000) });
                     if (DEBUG) console.log('END by re-start:', startDate, '→', ev.date);
                 }
-
                 inGroup = true;
                 tStart = ev.dt;
                 startDate = ev.date;
@@ -139,13 +122,8 @@
                 continue;
             }
 
-            // Переназначено/принято группой, НЕ являющейся нашей — обрезаем
             if (inGroup && leftOurGroup(ev) && ev.dt > tStart) {
-                intervals.push({
-                    start: startDate,
-                    end: ev.date,
-                    min: Math.round((ev.dt - tStart) / 60000)
-                });
+                intervals.push({ start: startDate, end: ev.date, min: Math.round((ev.dt - tStart) / 60000) });
                 if (DEBUG) console.log('END by leaving:', startDate, '→', ev.date, ev.gAssgn || ev.gExec);
                 inGroup = false;
                 tStart = null;
@@ -153,13 +131,8 @@
                 continue;
             }
 
-            // Выполнено нашей группой (включая подгруппы) — обрезаем
             if (inGroup && isFinishByUs(ev) && ev.dt > tStart) {
-                intervals.push({
-                    start: startDate,
-                    end: ev.date,
-                    min: Math.round((ev.dt - tStart) / 60000)
-                });
+                intervals.push({ start: startDate, end: ev.date, min: Math.round((ev.dt - tStart) / 60000) });
                 if (DEBUG) console.log('END by finish:', startDate, '→', ev.date);
                 inGroup = false;
                 tStart = null;
@@ -167,7 +140,6 @@
             }
         }
 
-        // Хвост (незавершённый период) намеренно не учитываем для SLA.
         const total = intervals.reduce((s, p) => s + p.min, 0);
         return { intervals, total };
     }
@@ -199,10 +171,8 @@
         const events = extractEvents();
         const { intervals, total } = computeIntervals(events);
 
-        // Итог
         let msg = `Время на группе «${TARGET_GROUP}»: ${Math.floor(total / 60)} ч ${total % 60} мин`;
         if (intervals.length > 1) msg += ` (интервалов: ${intervals.length})`;
-
         showBadge(msg);
 
         if (DEBUG) {
@@ -212,20 +182,25 @@
     }
 
     function readyLoop() {
-        if (document.getElementById('actionGrid')) {
-            main();
-            const mo = new MutationObserver(main);
-            mo.observe(document.getElementById('actionGrid'), { childList: true, subtree: true });
-        } else {
-            setTimeout(readyLoop, 400);
-        }
+        const run = () => {
+            if (document.getElementById('actionGrid') || document.body) {
+                main();
+                const grid = document.getElementById('actionGrid') || document.body;
+                const mo = new MutationObserver(() => main());
+                mo.observe(grid, { childList: true, subtree: true });
+            } else {
+                setTimeout(run, 400);
+            }
+        };
+        run();
     }
 
-    // Реакция на SPA-навигацию Assyst
+    // Реакция на SPA-навигацию и изменения hash
     const p = history.pushState, r = history.replaceState;
     history.pushState = function () { const o = p.apply(this, arguments); window.dispatchEvent(new Event('assyst-route')); return o; };
     history.replaceState = function () { const o = r.apply(this, arguments); window.dispatchEvent(new Event('assyst-route')); return o; };
     window.addEventListener('popstate', () => window.dispatchEvent(new Event('assyst-route')));
+    window.addEventListener('hashchange', () => window.dispatchEvent(new Event('assyst-route')));
     window.addEventListener('assyst-route', () => readyLoop());
 
     readyLoop();
