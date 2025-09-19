@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst: время на группе 1С Сопровождение ФТО (SLA, чистые интервалы)
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.8.5
+// @version      1.8.7
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto.js
 // @description  Считает только время, когда тикет реально назначен на «1С Сопровождение ФТО». Интервалы обрезаются на повторном старте/переназначении/Выполнить. Поддерживает подгруппы (Администраторы) и hash-навигацию.
