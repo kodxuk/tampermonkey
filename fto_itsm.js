@@ -2,6 +2,8 @@
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
 // @version      1.0
+// @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
+// @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
 // @author       kodx
 // @match        https://itsm.cherkizovsky.net/*
