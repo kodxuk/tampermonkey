@@ -20,7 +20,7 @@
   'use strict';
 
   // ===== Config =====
-  const DEBUG = true;                        // включить/выключить логи и бейдж
+  const DEBUG = false;                        // включить/выключить логи и бейдж
   const ACTIVE_ONLY  = true;                 // возврат только в активной вкладке
   const SUPPRESS_MS  = 15000;                // подавление возврата на других вкладках
   const WATCHDOG_MS  = 6000;                 // «белый экран» перезагрузка (один раз)
