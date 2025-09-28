@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.5
+// @version      1.6
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -246,7 +246,7 @@
     if (e.key === LOCK_KEY && e.newValue) suppressUntil = Date.now() + SUPPRESS_MS;
   });
 
-  // ===== Ping + backoff =====
+  // ===== Ping + backoff (single declaration) =====
   let backoffAttempts = 0;
   const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -352,7 +352,7 @@
     return true;
   };
 
-  // ===== Guarded return (ping + backoff) =====
+  // ===== Guarded return (single definition) =====
   const guardedReturn = async (why='auto') => {
     if (ACTIVE_ONLY && !isActive()) return false;
     if (Date.now() < suppressUntil) return false;
@@ -368,77 +368,6 @@
     backoffAttempts = 0;
     return tryReturn(why);
   };
-
-  // ===== Debug panel (no hotkeys) =====
-  if (DEBUG) {
-    const byId = (id) => document.getElementById(id);
-    const mountPanel = () => {
-      if (byId('assystar-debug-panel')) return;
-      const el = document.createElement('div');
-      el.id = 'assystar-debug-panel';
-      el.setAttribute('role','status');
-      el.setAttribute('aria-live','polite');
-      Object.assign(el.style, {
-        position:'fixed', right:'8px', bottom:'64px', zIndex:2147483647,
-        background:'rgba(0,0,0,.75)', color:'#fff', padding:'6px 8px',
-        font:'12px/16px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
-        borderRadius:'6px', boxShadow:'0 2px 8px #0008', minWidth:'280px',
-        maxWidth:'420px', pointerEvents:'auto', whiteSpace:'pre-wrap'
-      });
-      el.innerHTML =
-        'AssystAR • Debug\n' +
-        'tabId: <span id="ar_tab"></span>\n' +
-        'vis: <span id="ar_vis"></span> focus: <span id="ar_focus"></span> online: <span id="ar_net"></span>\n' +
-        'suppress: <span id="ar_sup"></span> backoff: <span id="ar_bk"></span>\n' +
-        'page: <span id="ar_page"></span> autoRefresh: <span id="ar_ar"></span>\n' +
-        'recovery: <span id="ar_rec"></span>\n' +
-        'last: <span id="ar_last"></span>';
-      document.body.appendChild(el);
-
-      // drag
-      let sx=0, sy=0, ox=0, oy=0, dragging=false;
-      el.addEventListener('mousedown', (e)=>{ dragging=true; sx=e.clientX; sy=e.clientY; ox=parseInt(el.style.right)||8; oy=parseInt(el.style.bottom)||64; el.style.cursor='grabbing'; });
-      window.addEventListener('mouseup', ()=>{ dragging=false; el.style.cursor='default'; });
-      window.addEventListener('mousemove', (e)=>{ if(!dragging) return; const dx=e.clientX-sx, dy=e.clientY-sy; el.style.right=Math.max(0,ox-dx)+'px'; el.style.bottom=Math.max(0,oy-dy)+'px'; });
-
-      const closeBtn = document.createElement('button');
-      closeBtn.textContent = '×';
-      Object.assign(closeBtn.style, { position:'absolute', top:'2px', right:'4px', background:'transparent', color:'#fff', border:'none', cursor:'pointer', fontSize:'14px' });
-      closeBtn.onclick = ()=> el.remove();
-      el.appendChild(closeBtn);
-    };
-
-    const upd = () => {
-      const p = document.getElementById('assystar-debug-panel'); if (!p) return;
-      const set = (id, v) => { const n=document.getElementById(id); if (n) n.textContent = String(v); };
-      set('ar_tab', TAB_ID);
-      set('ar_vis', document.visibilityState);
-      set('ar_focus', (document.hasFocus && document.hasFocus()) ? 'yes' : 'no');
-      set('ar_net', navigator.onLine ? 'online' : 'offline');
-      const left = Math.max(0, Math.ceil((suppressUntil - Date.now())/1000));
-      set('ar_sup', left ? `${left}s` : '0');
-      set('ar_bk', backoffAttempts);
-      const page = isEventSearchPage() ? 'eventsearch' : (/#event\/DisplayEvent\.do\b/i.test(location.href) ? 'event' : 'other');
-      set('ar_page', page);
-      const ar = hasAutoRefreshUI() ? 'ui' : (hadRecentNetwork() ? 'net' : 'no');
-      set('ar_ar', ar);
-      const rec = recoveryState();
-      set('ar_rec', `stage=${rec.stage}`);
-      const last = readLast();
-      if (last && last.href) {
-        const short = last.href.length>120 ? (last.href.slice(0,117)+'…') : last.href;
-        set('ar_last', `rank=${last.rank} • ${new Date(last.ts).toLocaleTimeString('ru-RU')} • ${short}`);
-      } else set('ar_last','—');
-    };
-
-    const ensure = () => {
-      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountPanel, { once:true });
-      else mountPanel();
-      upd();
-    };
-    ensure();
-    setInterval(upd, 1000);
-  }
 
   // ===== Wiring =====
   const logoutLike = /\/logout\/|sessionInvalid=true/i.test(location.href);
@@ -460,21 +389,4 @@
 
   addEventListener('load', scheduleRecoveryChecks, { once:true });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') scheduleRecoveryChecks(); });
-
-  // ===== Guarded return impl =====
-  async function guardedReturn(why='auto') {
-    if (ACTIVE_ONLY && !isActive()) return false;
-    if (Date.now() < suppressUntil) return false;
-    const ready = await pingReady();
-    if (!ready) {
-      backoffAttempts++;
-      const delay = calcBackoff();
-      dbg('Server not ready, backoff ms=', delay);
-      bus && bus.postMessage({ type:'suppress', ts: Date.now() });
-      await new Promise(r => setTimeout(r, delay));
-      return false;
-    }
-    backoffAttempts = 0;
-    return tryReturn(why);
-  }
 })();
