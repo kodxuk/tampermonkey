@@ -21,7 +21,7 @@
   'use strict';
 
   // ===== Config (High Load) =====
-  const DEBUG = true;
+  const DEBUG = false;
   const ACTIVE_ONLY  = true;
   const SUPPRESS_MS  = 25000;
   const WATCHDOG_MS  = 7000;
