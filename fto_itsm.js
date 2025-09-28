@@ -21,23 +21,23 @@
   'use strict';
 
   // ===== Config (High Load) =====
-  const DEBUG = false;
+  const DEBUG = true;
   const ACTIVE_ONLY  = true;
-  const SUPPRESS_MS  = 25000;              // подавление остальных вкладок 25 c
-  const WATCHDOG_MS  = 7000;               // первичная проверка через 7 c
-  const WATCHDOG_STEP_MS = 8000;           // шаг между ступенями 8 c
-  const LAST_TTL_MS  = 24*60*60*1000;      // TTL «последнего URL» 24ч
-  const COLD_START_DOWNGRADE_MS = 5*60*1000; // первые 5 мин — понижаем карточку до списка
-  const MAX_RECOVERY_STAGE = 3;            // 0..3 (CACHEBUSTER → SEARCH base → WELCOME)
-  const PING_URL = location.origin + '/assystweb/application.do'; // лёгкий пинг
+  const SUPPRESS_MS  = 25000;
+  const WATCHDOG_MS  = 7000;
+  const WATCHDOG_STEP_MS = 8000;
+  const LAST_TTL_MS  = 24*60*60*1000;
+  const COLD_START_DOWNGRADE_MS = 5*60*1000;
+  const MAX_RECOVERY_STAGE = 3;
+  const PING_URL = location.origin + '/assystweb/application.do';
   const PING_TIMEOUT_MS = 1500;
   const BACKOFF_BASE_MS = 1200;
   const BACKOFF_MAX_MS  = 15000;
 
   // ===== Keys / channel =====
-  const KEY_LAST_OBJ     = 'assyst_last_obj';     // { href, ts, rank }
-  const TRACE_KEY        = 'assyst_return_trace'; // session-only banner
-  const RECOVERY_KEY     = 'assyst_recovery_stage'; // {stage, ts}
+  const KEY_LAST_OBJ     = 'assyst_last_obj';
+  const TRACE_KEY        = 'assyst_return_trace';
+  const RECOVERY_KEY     = 'assyst_recovery_stage';
   const TAB_ID_KEY       = 'assyst_tab_id';
   const LOCK_KEY         = 'assyst_return_lock';
   const BUS_NAME         = 'assyst_ar_bus';
@@ -52,7 +52,7 @@
   let TAB_ID = sessionStorage.getItem(TAB_ID_KEY);
   if (!TAB_ID) { TAB_ID = Math.random().toString(36).slice(2); sessionStorage.setItem(TAB_ID_KEY, TAB_ID); }
 
-  // ===== UI: Debug badge + Return banner =====
+  // ===== UI =====
   if (DEBUG) {
     const mountBadge = () => {
       if (document.getElementById('assystar-debug-badge')) return;
@@ -160,7 +160,6 @@
     if (!raw) return null; try { return JSON.parse(raw); } catch { return null; }
   };
 
-  // Fallback из хэша logout-страницы
   const routeFromHash = () => {
     if (!location.hash || location.hash.length <= 1) return null;
     try {
@@ -170,7 +169,6 @@
     } catch { return null; }
   };
 
-  // Автоклик по кнопке «Вернуться в сервисдеск»
   const clickReturnButton = () => {
     const attempt = () => {
       const btn = [...document.querySelectorAll('a,button')]
@@ -225,8 +223,8 @@
     if (e.key === LOCK_KEY && e.newValue) suppressUntil = Date.now() + SUPPRESS_MS;
   });
 
-  // ===== Ping + backoff =====
-  let backoffAttempts = 0;
+  // ===== Ping + backoff (единственное объявление backoffAttempts) =====
+  let backoffAttempts = 0; // <<< оставляем только здесь
   const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -326,18 +324,17 @@
     return true;
   };
 
-  // Обёртка с пингом и бэкоффом
-  let backoffAttempts = 0;
+  // Обёртка с пингом и бэкоффом (без повторного объявления backoffAttempts)
   const guardedReturn = async (why='auto') => {
     if (ACTIVE_ONLY && !isActive()) return false;
     if (Date.now() < suppressUntil) return false;
-    const ctrlReady = await pingReady();
-    if (!ctrlReady) {
+    const ready = await pingReady();
+    if (!ready) {
       backoffAttempts++;
       const delay = calcBackoff();
       dbg('Server not ready, backoff ms=', delay);
       announceSuppress();
-      await sleep(delay);
+      await new Promise(r => setTimeout(r, delay));
       return false;
     }
     backoffAttempts = 0;
@@ -354,7 +351,7 @@
       clickReturnButton();
       document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') guardedReturn('visible'); });
       addEventListener('focus', () => guardedReturn('focus'));
-      if (!isOnline()) window.addEventListener('online', () => guardedReturn('online'), { once:true });
+      if (!navigator.onLine) window.addEventListener('online', () => guardedReturn('online'), { once:true });
     });
   }
 
