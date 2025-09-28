@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.2
+// @version      1.3
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -22,22 +22,22 @@
 
   // ===== Config (High Load) =====
   const DEBUG = false;
-  const ACTIVE_ONLY  = true;
-  const SUPPRESS_MS  = 25000;
-  const WATCHDOG_MS  = 7000;
-  const WATCHDOG_STEP_MS = 8000;
-  const LAST_TTL_MS  = 24*60*60*1000;
-  const COLD_START_DOWNGRADE_MS = 5*60*1000;
-  const MAX_RECOVERY_STAGE = 3;
-  const PING_URL = location.origin + '/assystweb/application.do';
+  const ACTIVE_ONLY  = true;                 // возврат только в активной вкладке
+  const SUPPRESS_MS  = 25000;                // подавление остальных вкладок 25 c
+  const WATCHDOG_MS  = 7000;                 // первичная проверка через 7 c
+  const WATCHDOG_STEP_MS = 8000;             // шаг между ступенями 8 c
+  const LAST_TTL_MS  = 24*60*60*1000;        // TTL «последнего URL» 24ч
+  const COLD_START_DOWNGRADE_MS = 5*60*1000; // первые 5 мин — понижаем карточку до списка
+  const MAX_RECOVERY_STAGE = 3;              // 0..3 (CACHEBUSTER → SEARCH base → WELCOME)
+  const PING_URL = location.origin + '/assystweb/application.do'; // лёгкий пинг
   const PING_TIMEOUT_MS = 1500;
   const BACKOFF_BASE_MS = 1200;
   const BACKOFF_MAX_MS  = 15000;
 
   // ===== Keys / channel =====
-  const KEY_LAST_OBJ     = 'assyst_last_obj';
-  const TRACE_KEY        = 'assyst_return_trace';
-  const RECOVERY_KEY     = 'assyst_recovery_stage';
+  const KEY_LAST_OBJ     = 'assyst_last_obj';     // { href, ts, rank }
+  const TRACE_KEY        = 'assyst_return_trace'; // session-only banner
+  const RECOVERY_KEY     = 'assyst_recovery_stage'; // {stage, ts}
   const TAB_ID_KEY       = 'assyst_tab_id';
   const LOCK_KEY         = 'assyst_return_lock';
   const BUS_NAME         = 'assyst_ar_bus';
@@ -137,18 +137,20 @@
     if (/\/logout\/|sessionInvalid=true/i.test(location.href)) { dbg('Skip save: logout', why); return; }
     if (!isWorkingPage()) { dbg('Skip save: not app.do', location.href); return; }
     if (document.visibilityState !== 'visible') { dbg('Skip save: hidden'); return; }
+
     const href = canonicalize(location.href);
     const r = routeRank(href);
     if (r <= 0) return;
     if (href === lastHref) return;
     if (r < lastRankSeen) return;
+
     lastRankSeen = r; lastHref = href;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       const obj = { href, ts: Date.now(), rank: r };
       localStorage.setItem(KEY_LAST_OBJ, JSON.stringify(obj));
       sessionStorage.setItem(KEY_LAST_OBJ, JSON.stringify(obj));
-      info('Saved last', obj, 'why=', why);
+      info('Saved last:', { href: obj.href, rank: obj.rank, at: new Date(obj.ts).toLocaleString('ru-RU') }, 'why=', why);
     }, 200);
   };
   ['load','popstate','hashchange','click','keydown','visibilitychange']
@@ -160,6 +162,7 @@
     if (!raw) return null; try { return JSON.parse(raw); } catch { return null; }
   };
 
+  // Fallback из хэша logout-страницы
   const routeFromHash = () => {
     if (!location.hash || location.hash.length <= 1) return null;
     try {
@@ -169,6 +172,7 @@
     } catch { return null; }
   };
 
+  // Автоклик по кнопке «Вернуться в сервисдеск»
   const clickReturnButton = () => {
     const attempt = () => {
       const btn = [...document.querySelectorAll('a,button')]
@@ -223,8 +227,8 @@
     if (e.key === LOCK_KEY && e.newValue) suppressUntil = Date.now() + SUPPRESS_MS;
   });
 
-  // ===== Ping + backoff (единственное объявление backoffAttempts) =====
-  let backoffAttempts = 0; // <<< оставляем только здесь
+  // ===== Ping + backoff (single declaration) =====
+  let backoffAttempts = 0;  // важно: объявлено один раз, без дублей
   const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -324,17 +328,18 @@
     return true;
   };
 
-  // Обёртка с пингом и бэкоффом (без повторного объявления backoffAttempts)
+  // ===== Guarded return (ping + backoff) =====
   const guardedReturn = async (why='auto') => {
     if (ACTIVE_ONLY && !isActive()) return false;
     if (Date.now() < suppressUntil) return false;
+
     const ready = await pingReady();
     if (!ready) {
       backoffAttempts++;
       const delay = calcBackoff();
       dbg('Server not ready, backoff ms=', delay);
       announceSuppress();
-      await new Promise(r => setTimeout(r, delay));
+      await sleep(delay);
       return false;
     }
     backoffAttempts = 0;
