@@ -1,15 +1,20 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
-// @namespace    https://example.com/assyst
+// @namespace    https://github.com/kodxuk/tampermonkey
 // @version      1.1
-// @description  Надёжный автоворзват с межвкладочным lock, офлайн-гейтингом и watchdog
+// @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
+// @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
+// @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
+// @author       kodx
 // @match        https://itsm.cherkizovsky.net/*
 // @match        https://itsm/assystweb/*
+// @exclude      https://itsm/assystweb/scripts_release/dojo/resources/blank.html*
+// @exclude      https://itsm.cherkizovsky.net/assystweb/scripts_release/dojo/resources/blank.html*
 // @run-at       document-start
 // @noframes
 // @grant        none
 // @license      MIT
-// ==/UserScript==
+// ==UserScript==
 
 
 (function () {
