@@ -20,7 +20,7 @@
   'use strict';
 
   // ===== Config (High Load) =====
-  const DEBUG = true;
+  const DEBUG = false;
   const ACTIVE_ONLY  = true;
   const SUPPRESS_MS  = 25000;              // подавление остальных вкладок 25 c
   const WATCHDOG_MS  = 7000;               // первичная проверка через 7 c
