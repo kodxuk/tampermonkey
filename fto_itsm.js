@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.0
+// @version      1.1
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -14,25 +14,31 @@
 // @noframes
 // @grant        none
 // @license      MIT
-// ==/UserScript==
+// ==UserScript==
 
 (function () {
   'use strict';
 
-  // ===== Config =====
-  const DEBUG = false;                        // включить/выключить логи и бейдж
-  const ACTIVE_ONLY  = true;                 // возврат только в активной вкладке
-  const SUPPRESS_MS  = 15000;                // подавление возврата на других вкладках
-  const WATCHDOG_MS  = 6000;                 // «белый экран» перезагрузка (один раз)
-  const LAST_TTL_MS  = 24*60*60*1000;        // срок годности последнего URL (24ч)
-  const COLD_START_DOWNGRADE_MS = 2*60*1000; // в первые 2 мин понижать карточку до списка
+  // ===== Config (High Load) =====
+  const DEBUG = true;
+  const ACTIVE_ONLY  = true;
+  const SUPPRESS_MS  = 25000;              // подавление остальных вкладок 25 c
+  const WATCHDOG_MS  = 7000;               // первичная проверка через 7 c
+  const WATCHDOG_STEP_MS = 8000;           // шаг между ступенями 8 c
+  const LAST_TTL_MS  = 24*60*60*1000;      // TTL «последнего URL» 24ч
+  const COLD_START_DOWNGRADE_MS = 5*60*1000; // первые 5 мин — понижаем карточку до списка
+  const MAX_RECOVERY_STAGE = 3;            // 0..3 (CACHEBUSTER → SEARCH base → WELCOME)
+  const PING_URL = location.origin + '/assystweb/application.do'; // лёгкий пинг
+  const PING_TIMEOUT_MS = 1500;
+  const BACKOFF_BASE_MS = 1200;
+  const BACKOFF_MAX_MS  = 15000;
 
   // ===== Keys / channel =====
   const KEY_LAST_OBJ     = 'assyst_last_obj';     // { href, ts, rank }
-  const TRACE_KEY        = 'assyst_return_trace'; // session-only метка возврата
-  const RELOAD_ONCE_KEY  = 'assyst_reload_once';
+  const TRACE_KEY        = 'assyst_return_trace'; // session-only banner
+  const RECOVERY_KEY     = 'assyst_recovery_stage'; // {stage, ts}
   const TAB_ID_KEY       = 'assyst_tab_id';
-  const LOCK_KEY         = 'assyst_return_lock';  // { tabId, ts }
+  const LOCK_KEY         = 'assyst_return_lock';
   const BUS_NAME         = 'assyst_ar_bus';
 
   // ===== Logging =====
@@ -45,7 +51,7 @@
   let TAB_ID = sessionStorage.getItem(TAB_ID_KEY);
   if (!TAB_ID) { TAB_ID = Math.random().toString(36).slice(2); sessionStorage.setItem(TAB_ID_KEY, TAB_ID); }
 
-  // ===== UI: Debug badge (bottom-right) =====
+  // ===== UI: Debug badge + Return banner =====
   if (DEBUG) {
     const mountBadge = () => {
       if (document.getElementById('assystar-debug-badge')) return;
@@ -64,7 +70,6 @@
     else mountBadge();
   }
 
-  // ===== UI: Return banner (session only, above badge) =====
   const fmt = (ms) => new Date(ms).toLocaleString('ru-RU', {
     hour:'2-digit', minute:'2-digit', second:'2-digit',
     day:'2-digit', month:'2-digit', year:'numeric', hour12:false
@@ -125,24 +130,18 @@
   };
   const isAcceptable = (u) => u && u.startsWith(location.origin) && /\/assystweb\/application\.do#/i.test(u);
 
-  // ===== Save last as {href, ts, rank} =====
-  let lastRankSeen = -1;
-  let lastHref = null;
-  let saveTimer = null;
+  // ===== Save last {href, ts, rank} =====
+  let lastRankSeen = -1, lastHref = null, saveTimer = null;
   const saveLast = (why='event') => {
     if (/\/logout\/|sessionInvalid=true/i.test(location.href)) { dbg('Skip save: logout', why); return; }
     if (!isWorkingPage()) { dbg('Skip save: not app.do', location.href); return; }
     if (document.visibilityState !== 'visible') { dbg('Skip save: hidden'); return; }
-
     const href = canonicalize(location.href);
     const r = routeRank(href);
     if (r <= 0) return;
     if (href === lastHref) return;
     if (r < lastRankSeen) return;
-
-    lastRankSeen = r;
-    lastHref = href;
-
+    lastRankSeen = r; lastHref = href;
     clearTimeout(saveTimer);
     saveTimer = setTimeout(() => {
       const obj = { href, ts: Date.now(), rank: r };
@@ -157,8 +156,7 @@
 
   const readLast = () => {
     const raw = sessionStorage.getItem(KEY_LAST_OBJ) || localStorage.getItem(KEY_LAST_OBJ);
-    if (!raw) return null;
-    try { return JSON.parse(raw); } catch { return null; }
+    if (!raw) return null; try { return JSON.parse(raw); } catch { return null; }
   };
 
   // Fallback из хэша logout-страницы
@@ -184,11 +182,9 @@
     mo.observe(document.documentElement, { childList:true, subtree:true });
   };
 
-  // ===== Active/online helpers =====
+  // ===== Active/online & cold start =====
   const isActive = () => document.visibilityState==='visible' && document.hasFocus && document.hasFocus();
   const isOnline = () => navigator.onLine !== false;
-
-  // Cold-start baseline (per session)
   const coldStartSince = (() => {
     const k='assyst_session_boot';
     let t = sessionStorage.getItem(k);
@@ -196,15 +192,17 @@
     return Number(t);
   })();
 
-  // ===== Inter-tab lock and bus =====
+  // ===== Inter-tab bus/lock =====
   const bus = ('BroadcastChannel' in window) ? new BroadcastChannel(BUS_NAME) : null;
   let suppressUntil = 0;
   bus && (bus.onmessage = (e) => {
-    if (e && e.data && e.data.type==='returned') {
+    if (e?.data?.type === 'returned' || e?.data?.type === 'suppress') {
       suppressUntil = Date.now() + SUPPRESS_MS;
-      dbg('Suppressed by other tab until', new Date(suppressUntil).toISOString());
+      dbg('Suppressed until', new Date(suppressUntil).toISOString());
     }
   });
+  const announceSuppress = () => bus && bus.postMessage({ type:'suppress', ts: Date.now() });
+
   const lockAcquire = () => {
     const now = Date.now();
     let lock = null;
@@ -226,13 +224,81 @@
     if (e.key === LOCK_KEY && e.newValue) suppressUntil = Date.now() + SUPPRESS_MS;
   });
 
-  // ===== Return =====
-  const logoutLike = /\/logout\/|sessionInvalid=true/i.test(location.href);
-  const loginLike  = /login|signin|authenticate/i.test(location.pathname);
+  // ===== Ping + backoff =====
+  let backoffAttempts = 0;
+  const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
+  const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+  const pingReady = async () => {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), PING_TIMEOUT_MS);
+    try {
+      const res = await fetch(PING_URL, { method:'HEAD', cache:'no-store', signal: ctrl.signal });
+      return res.ok;
+    } catch { return false; } finally { clearTimeout(t); }
+  };
+  const calcBackoff = () => {
+    const raw = Math.min(BACKOFF_MAX_MS, BACKOFF_BASE_MS * Math.pow(2, backoffAttempts));
+    return jitter(raw);
+  };
+
+  // ===== Recovery helpers (blank page) =====
+  const recoveryState = () => { try { return JSON.parse(sessionStorage.getItem(RECOVERY_KEY) || '{"stage":0,"ts":0}'); } catch { return {stage:0,ts:0}; } };
+  const setRecovery = (stage) => sessionStorage.setItem(RECOVERY_KEY, JSON.stringify({ stage, ts: Date.now() }));
+  const resetRecovery = () => setRecovery(0);
+
+  const pageLooksBlank = () => {
+    const b = document.body;
+    if (!b) return true;
+    const childCount = b.children.length;
+    const textLen = (b.textContent || '').trim().length;
+    return childCount < 3 && textLen < 40;
+  };
+  const addCacheBusterToHash = (href) => {
+    try {
+      const [base, hash=''] = href.split('#');
+      if (!hash) return href;
+      const qIndex = hash.indexOf('?');
+      if (qIndex === -1) return `${base}#${hash}?_r=${Date.now()}`;
+      return `${base}#${hash}&_r=${Date.now()}`;
+    } catch { return href; }
+  };
+  const toSearchBase = () => location.origin + '/assystweb/application.do#eventsearch/EventSearchDelegatingDispatchAction.do?dispatch=loadQuery';
+  const toWelcome     = () => location.origin + '/assystweb/application.do#welcome/WelcomeDispatchAction.do?dispatch=refresh';
+
+  const escalateRecovery = () => {
+    if (ACTIVE_ONLY && !isActive()) return;
+    const st = recoveryState();
+    if (st.stage >= MAX_RECOVERY_STAGE) { warn('Recovery limit reached'); return; }
+    let target = null;
+    if (st.stage === 0) {
+      target = addCacheBusterToHash(location.href);
+      info('Recovery stage 1: cache-buster reload', target);
+    } else if (st.stage === 1) {
+      target = toSearchBase();
+      info('Recovery stage 2: SEARCH base', target);
+    } else if (st.stage === 2) {
+      target = toWelcome();
+      info('Recovery stage 3: WELCOME base', target);
+    }
+    setRecovery(st.stage + 1);
+    if (target) location.replace(target);
+  };
+
+  const scheduleRecoveryChecks = () => {
+    if (!isWorkingPage()) return;
+    setTimeout(() => { if (pageLooksBlank()) escalateRecovery(); }, WATCHDOG_MS);
+    let checks = 3;
+    const iv = setInterval(() => {
+      if (!pageLooksBlank()) { clearInterval(iv); resetRecovery(); return; }
+      escalateRecovery();
+      if (--checks <= 0) clearInterval(iv);
+    }, WATCHDOG_STEP_MS);
+  };
+
+  // ===== Return core =====
   const tryReturn = (why='auto') => {
     if (ACTIVE_ONLY && !isActive()) { dbg('Skip return: not active'); return false; }
-    if (!isOnline()) { dbg('Skip return: offline, wait online'); window.addEventListener('online', () => tryReturn('online'), { once:true }); return false; }
     if (Date.now() < suppressUntil) { dbg('Skip return: suppressed'); return false; }
     if (!lockAcquire()) { dbg('Skip return: lock held'); return false; }
 
@@ -241,21 +307,15 @@
     let target  = last && last.href;
     const ageOk = last && (Date.now() - last.ts) <= LAST_TTL_MS;
 
-    // если нет свежего last — использовать хэш с logout
     if ((!target || !ageOk) && fromH) target = fromH;
 
-    // деградация карточки до списка сразу после холодного старта
     const cold = (Date.now() - coldStartSince) < COLD_START_DOWNGRADE_MS;
     if (cold && target && /#event\/DisplayEvent\.do\b/i.test(target)) {
       target = target.replace(/#event\/DisplayEvent\.do/i, '#eventsearch/EventSearchDelegatingDispatchAction.do');
       dbg('Cold-start downgrade to SEARCH');
     }
 
-    if (!isAcceptable(target)) {
-      dbg('No acceptable/stale target', { last, fromH });
-      lockRelease();
-      return false;
-    }
+    if (!isAcceptable(target)) { dbg('No acceptable/stale target', { last, fromH }); lockRelease(); return false; }
 
     const payload = { ts: Date.now(), why, target };
     try { sessionStorage.setItem(TRACE_KEY, JSON.stringify(payload)); } catch {}
@@ -265,35 +325,42 @@
     return true;
   };
 
-  if (logoutLike) {
-    if (!tryReturn('logout')) {
-      // автоклик по кнопке на экране выхода
-      clickReturnButton();
-
-      // повторные попытки, когда вкладка активируется/появляется сеть
-      document.addEventListener('visibilitychange', () => {
-        if (document.visibilityState==='visible') tryReturn('visible');
-      });
-      addEventListener('focus', () => tryReturn('focus'));
-      if (!isOnline()) window.addEventListener('online', () => tryReturn('online'), { once:true });
-
-      // watchdog «белого экрана» — один раз
-      setTimeout(() => {
-        if (!isActive()) return;
-        const once = sessionStorage.getItem(RELOAD_ONCE_KEY);
-        const tooEmpty = document.body && document.body.children && document.body.children.length < 2;
-        if (!once && tooEmpty) {
-          sessionStorage.setItem(RELOAD_ONCE_KEY, '1');
-          const last = readLast();
-          const fallback = routeFromHash();
-          const t = (last && last.href) || fallback;
-          if (t && isAcceptable(t)) location.replace(t);
-        }
-      }, WATCHDOG_MS);
+  // Обёртка с пингом и бэкоффом
+  let backoffAttempts = 0;
+  const guardedReturn = async (why='auto') => {
+    if (ACTIVE_ONLY && !isActive()) return false;
+    if (Date.now() < suppressUntil) return false;
+    const ctrlReady = await pingReady();
+    if (!ctrlReady) {
+      backoffAttempts++;
+      const delay = calcBackoff();
+      dbg('Server not ready, backoff ms=', delay);
+      announceSuppress();
+      await sleep(delay);
+      return false;
     }
+    backoffAttempts = 0;
+    return tryReturn(why);
+  };
+
+  // ===== Wiring =====
+  const logoutLike = /\/logout\/|sessionInvalid=true/i.test(location.href);
+  const loginLike  = /login|signin|authenticate/i.test(location.pathname);
+
+  if (logoutLike) {
+    guardedReturn('logout').then((ok) => {
+      if (ok) return;
+      clickReturnButton();
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') guardedReturn('visible'); });
+      addEventListener('focus', () => guardedReturn('focus'));
+      if (!isOnline()) window.addEventListener('online', () => guardedReturn('online'), { once:true });
+    });
   }
 
   if (!logoutLike && loginLike) {
-    addEventListener('load', () => setTimeout(() => tryReturn('after-login'), 500));
+    addEventListener('load', () => setTimeout(() => guardedReturn('after-login'), 500));
   }
+
+  addEventListener('load', scheduleRecoveryChecks, { once:true });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') scheduleRecoveryChecks(); });
 })();
