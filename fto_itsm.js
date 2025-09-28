@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.4
+// @version      1.5
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -21,26 +21,24 @@
 
   // ===== Config (High Load) =====
   const DEBUG = false;
-  const ACTIVE_ONLY  = true;                  // возврат только в активной вкладке
-  const SUPPRESS_MS  = 25000;                 // подавление остальных вкладок 25 c
-  const WATCHDOG_MS  = 7000;                  // первичная проверка через 7 c
-  const WATCHDOG_STEP_MS = 8000;              // шаг между ступенями 8 c
-  const LAST_TTL_MS  = 24*60*60*1000;         // TTL «последнего URL» 24ч
-  const COLD_START_DOWNGRADE_MS = 5*60*1000;  // первые 5 мин — понижаем карточку до списка
-  const MAX_RECOVERY_STAGE = 3;               // 0..3 (CACHEBUSTER → SEARCH base → WELCOME)
-  // Учет автообновления списка
-  const AUTOREFRESH_GRACE_MS = 12000;         // 12 c грейс перед watchdog на eventsearch
-  const NET_ACTIVITY_WINDOW_MS = 5000;        // «недавние» загрузки ресурсов 5 c
-  // Пинг готовности сервера и бэкофф
+  const ACTIVE_ONLY  = true;
+  const SUPPRESS_MS  = 25000;
+  const WATCHDOG_MS  = 7000;
+  const WATCHDOG_STEP_MS = 8000;
+  const LAST_TTL_MS  = 24*60*60*1000;
+  const COLD_START_DOWNGRADE_MS = 5*60*1000;
+  const MAX_RECOVERY_STAGE = 3;
+  const AUTOREFRESH_GRACE_MS = 12000;
+  const NET_ACTIVITY_WINDOW_MS = 5000;
   const PING_URL = location.origin + '/assystweb/application.do';
   const PING_TIMEOUT_MS = 1500;
   const BACKOFF_BASE_MS = 1200;
   const BACKOFF_MAX_MS  = 15000;
 
   // ===== Keys / channel =====
-  const KEY_LAST_OBJ     = 'assyst_last_obj';     // { href, ts, rank }
-  const TRACE_KEY        = 'assyst_return_trace'; // session-only banner
-  const RECOVERY_KEY     = 'assyst_recovery_stage'; // {stage, ts}
+  const KEY_LAST_OBJ     = 'assyst_last_obj';
+  const TRACE_KEY        = 'assyst_return_trace';
+  const RECOVERY_KEY     = 'assyst_recovery_stage';
   const TAB_ID_KEY       = 'assyst_tab_id';
   const LOCK_KEY         = 'assyst_return_lock';
   const BUS_NAME         = 'assyst_ar_bus';
@@ -55,7 +53,7 @@
   let TAB_ID = sessionStorage.getItem(TAB_ID_KEY);
   if (!TAB_ID) { TAB_ID = Math.random().toString(36).slice(2); sessionStorage.setItem(TAB_ID_KEY, TAB_ID); }
 
-  // ===== UI =====
+  // ===== UI: debug badge =====
   if (DEBUG) {
     const mountBadge = () => {
       if (document.getElementById('assystar-debug-badge')) return;
@@ -74,6 +72,7 @@
     else mountBadge();
   }
 
+  // ===== UI: return banner (session-only) =====
   const fmt = (ms) => new Date(ms).toLocaleString('ru-RU', {
     hour:'2-digit', minute:'2-digit', second:'2-digit',
     day:'2-digit', month:'2-digit', year:'numeric', hour12:false
@@ -136,9 +135,7 @@
 
   // ===== Auto-refresh awareness =====
   const isEventSearchPage = () => /#eventsearch\/EventSearchDelegatingDispatchAction\.do\b/i.test(location.href);
-  const hasAutoRefreshUI = () => {
-    return !!document.querySelector('[title*="Обновление"][role="menu"], [data-refresh], .auto-refresh');
-  };
+  const hasAutoRefreshUI = () => !!document.querySelector('[title*="Обновление"][role="menu"], [data-refresh], .auto-refresh');
   const hadRecentNetwork = () => {
     try {
       const now = performance.now();
@@ -158,7 +155,6 @@
     if (/\/logout\/|sessionInvalid=true/i.test(location.href)) { dbg('Skip save: logout', why); return; }
     if (!isWorkingPage()) { dbg('Skip save: not app.do', location.href); return; }
     if (document.visibilityState !== 'visible') { dbg('Skip save: hidden'); return; }
-    // не шуметь на автообновлении списка
     if (isEventSearchPage() && (why === 'hashchange' || hadRecentNetwork())) { dbg('Skip save: auto-refresh', why); return; }
 
     const href = canonicalize(location.href);
@@ -250,7 +246,7 @@
     if (e.key === LOCK_KEY && e.newValue) suppressUntil = Date.now() + SUPPRESS_MS;
   });
 
-  // ===== Ping + backoff (single declaration) =====
+  // ===== Ping + backoff =====
   let backoffAttempts = 0;
   const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
@@ -365,7 +361,6 @@
       backoffAttempts++;
       const delay = calcBackoff();
       dbg('Server not ready, backoff ms=', delay);
-      // подавить соседние вкладки на окно ожидания
       bus && bus.postMessage({ type:'suppress', ts: Date.now() });
       await sleep(delay);
       return false;
@@ -373,6 +368,77 @@
     backoffAttempts = 0;
     return tryReturn(why);
   };
+
+  // ===== Debug panel (no hotkeys) =====
+  if (DEBUG) {
+    const byId = (id) => document.getElementById(id);
+    const mountPanel = () => {
+      if (byId('assystar-debug-panel')) return;
+      const el = document.createElement('div');
+      el.id = 'assystar-debug-panel';
+      el.setAttribute('role','status');
+      el.setAttribute('aria-live','polite');
+      Object.assign(el.style, {
+        position:'fixed', right:'8px', bottom:'64px', zIndex:2147483647,
+        background:'rgba(0,0,0,.75)', color:'#fff', padding:'6px 8px',
+        font:'12px/16px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
+        borderRadius:'6px', boxShadow:'0 2px 8px #0008', minWidth:'280px',
+        maxWidth:'420px', pointerEvents:'auto', whiteSpace:'pre-wrap'
+      });
+      el.innerHTML =
+        'AssystAR • Debug\n' +
+        'tabId: <span id="ar_tab"></span>\n' +
+        'vis: <span id="ar_vis"></span> focus: <span id="ar_focus"></span> online: <span id="ar_net"></span>\n' +
+        'suppress: <span id="ar_sup"></span> backoff: <span id="ar_bk"></span>\n' +
+        'page: <span id="ar_page"></span> autoRefresh: <span id="ar_ar"></span>\n' +
+        'recovery: <span id="ar_rec"></span>\n' +
+        'last: <span id="ar_last"></span>';
+      document.body.appendChild(el);
+
+      // drag
+      let sx=0, sy=0, ox=0, oy=0, dragging=false;
+      el.addEventListener('mousedown', (e)=>{ dragging=true; sx=e.clientX; sy=e.clientY; ox=parseInt(el.style.right)||8; oy=parseInt(el.style.bottom)||64; el.style.cursor='grabbing'; });
+      window.addEventListener('mouseup', ()=>{ dragging=false; el.style.cursor='default'; });
+      window.addEventListener('mousemove', (e)=>{ if(!dragging) return; const dx=e.clientX-sx, dy=e.clientY-sy; el.style.right=Math.max(0,ox-dx)+'px'; el.style.bottom=Math.max(0,oy-dy)+'px'; });
+
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '×';
+      Object.assign(closeBtn.style, { position:'absolute', top:'2px', right:'4px', background:'transparent', color:'#fff', border:'none', cursor:'pointer', fontSize:'14px' });
+      closeBtn.onclick = ()=> el.remove();
+      el.appendChild(closeBtn);
+    };
+
+    const upd = () => {
+      const p = document.getElementById('assystar-debug-panel'); if (!p) return;
+      const set = (id, v) => { const n=document.getElementById(id); if (n) n.textContent = String(v); };
+      set('ar_tab', TAB_ID);
+      set('ar_vis', document.visibilityState);
+      set('ar_focus', (document.hasFocus && document.hasFocus()) ? 'yes' : 'no');
+      set('ar_net', navigator.onLine ? 'online' : 'offline');
+      const left = Math.max(0, Math.ceil((suppressUntil - Date.now())/1000));
+      set('ar_sup', left ? `${left}s` : '0');
+      set('ar_bk', backoffAttempts);
+      const page = isEventSearchPage() ? 'eventsearch' : (/#event\/DisplayEvent\.do\b/i.test(location.href) ? 'event' : 'other');
+      set('ar_page', page);
+      const ar = hasAutoRefreshUI() ? 'ui' : (hadRecentNetwork() ? 'net' : 'no');
+      set('ar_ar', ar);
+      const rec = recoveryState();
+      set('ar_rec', `stage=${rec.stage}`);
+      const last = readLast();
+      if (last && last.href) {
+        const short = last.href.length>120 ? (last.href.slice(0,117)+'…') : last.href;
+        set('ar_last', `rank=${last.rank} • ${new Date(last.ts).toLocaleTimeString('ru-RU')} • ${short}`);
+      } else set('ar_last','—');
+    };
+
+    const ensure = () => {
+      if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', mountPanel, { once:true });
+      else mountPanel();
+      upd();
+    };
+    ensure();
+    setInterval(upd, 1000);
+  }
 
   // ===== Wiring =====
   const logoutLike = /\/logout\/|sessionInvalid=true/i.test(location.href);
@@ -394,4 +460,21 @@
 
   addEventListener('load', scheduleRecoveryChecks, { once:true });
   document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') scheduleRecoveryChecks(); });
+
+  // ===== Guarded return impl =====
+  async function guardedReturn(why='auto') {
+    if (ACTIVE_ONLY && !isActive()) return false;
+    if (Date.now() < suppressUntil) return false;
+    const ready = await pingReady();
+    if (!ready) {
+      backoffAttempts++;
+      const delay = calcBackoff();
+      dbg('Server not ready, backoff ms=', delay);
+      bus && bus.postMessage({ type:'suppress', ts: Date.now() });
+      await new Promise(r => setTimeout(r, delay));
+      return false;
+    }
+    backoffAttempts = 0;
+    return tryReturn(why);
+  }
 })();
