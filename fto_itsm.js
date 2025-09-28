@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.3
+// @version      1.4
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -16,20 +16,23 @@
 // @license      MIT
 // ==UserScript==
 
-
 (function () {
   'use strict';
 
   // ===== Config (High Load) =====
   const DEBUG = false;
-  const ACTIVE_ONLY  = true;                 // возврат только в активной вкладке
-  const SUPPRESS_MS  = 25000;                // подавление остальных вкладок 25 c
-  const WATCHDOG_MS  = 7000;                 // первичная проверка через 7 c
-  const WATCHDOG_STEP_MS = 8000;             // шаг между ступенями 8 c
-  const LAST_TTL_MS  = 24*60*60*1000;        // TTL «последнего URL» 24ч
-  const COLD_START_DOWNGRADE_MS = 5*60*1000; // первые 5 мин — понижаем карточку до списка
-  const MAX_RECOVERY_STAGE = 3;              // 0..3 (CACHEBUSTER → SEARCH base → WELCOME)
-  const PING_URL = location.origin + '/assystweb/application.do'; // лёгкий пинг
+  const ACTIVE_ONLY  = true;                  // возврат только в активной вкладке
+  const SUPPRESS_MS  = 25000;                 // подавление остальных вкладок 25 c
+  const WATCHDOG_MS  = 7000;                  // первичная проверка через 7 c
+  const WATCHDOG_STEP_MS = 8000;              // шаг между ступенями 8 c
+  const LAST_TTL_MS  = 24*60*60*1000;         // TTL «последнего URL» 24ч
+  const COLD_START_DOWNGRADE_MS = 5*60*1000;  // первые 5 мин — понижаем карточку до списка
+  const MAX_RECOVERY_STAGE = 3;               // 0..3 (CACHEBUSTER → SEARCH base → WELCOME)
+  // Учет автообновления списка
+  const AUTOREFRESH_GRACE_MS = 12000;         // 12 c грейс перед watchdog на eventsearch
+  const NET_ACTIVITY_WINDOW_MS = 5000;        // «недавние» загрузки ресурсов 5 c
+  // Пинг готовности сервера и бэкофф
+  const PING_URL = location.origin + '/assystweb/application.do';
   const PING_TIMEOUT_MS = 1500;
   const BACKOFF_BASE_MS = 1200;
   const BACKOFF_MAX_MS  = 15000;
@@ -131,12 +134,32 @@
   };
   const isAcceptable = (u) => u && u.startsWith(location.origin) && /\/assystweb\/application\.do#/i.test(u);
 
+  // ===== Auto-refresh awareness =====
+  const isEventSearchPage = () => /#eventsearch\/EventSearchDelegatingDispatchAction\.do\b/i.test(location.href);
+  const hasAutoRefreshUI = () => {
+    return !!document.querySelector('[title*="Обновление"][role="menu"], [data-refresh], .auto-refresh');
+  };
+  const hadRecentNetwork = () => {
+    try {
+      const now = performance.now();
+      const entries = performance.getEntriesByType('resource');
+      for (let i = entries.length - 1; i >= 0; i--) {
+        if (now - entries[i].responseEnd <= NET_ACTIVITY_WINDOW_MS) return true;
+        if (now - entries[i].startTime > NET_ACTIVITY_WINDOW_MS) break;
+      }
+    } catch {}
+    return false;
+  };
+  const hasListContent = () => !!document.querySelector('table, .slickgrid, .dataTable, [role="grid"]');
+
   // ===== Save last {href, ts, rank} =====
   let lastRankSeen = -1, lastHref = null, saveTimer = null;
   const saveLast = (why='event') => {
     if (/\/logout\/|sessionInvalid=true/i.test(location.href)) { dbg('Skip save: logout', why); return; }
     if (!isWorkingPage()) { dbg('Skip save: not app.do', location.href); return; }
     if (document.visibilityState !== 'visible') { dbg('Skip save: hidden'); return; }
+    // не шуметь на автообновлении списка
+    if (isEventSearchPage() && (why === 'hashchange' || hadRecentNetwork())) { dbg('Skip save: auto-refresh', why); return; }
 
     const href = canonicalize(location.href);
     const r = routeRank(href);
@@ -228,7 +251,7 @@
   });
 
   // ===== Ping + backoff (single declaration) =====
-  let backoffAttempts = 0;  // важно: объявлено один раз, без дублей
+  let backoffAttempts = 0;
   const jitter = (ms) => Math.floor(ms * (0.75 + Math.random() * 0.5));
   const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
@@ -290,10 +313,15 @@
 
   const scheduleRecoveryChecks = () => {
     if (!isWorkingPage()) return;
-    setTimeout(() => { if (pageLooksBlank()) escalateRecovery(); }, WATCHDOG_MS);
+    const firstDelay = isEventSearchPage() ? (WATCHDOG_MS + AUTOREFRESH_GRACE_MS) : WATCHDOG_MS;
+    setTimeout(() => {
+      if (isEventSearchPage() && (hadRecentNetwork() || hasAutoRefreshUI() || hasListContent())) return;
+      if (pageLooksBlank()) escalateRecovery();
+    }, firstDelay);
     let checks = 3;
     const iv = setInterval(() => {
       if (!pageLooksBlank()) { clearInterval(iv); resetRecovery(); return; }
+      if (isEventSearchPage() && (hadRecentNetwork() || hasAutoRefreshUI())) return;
       escalateRecovery();
       if (--checks <= 0) clearInterval(iv);
     }, WATCHDOG_STEP_MS);
@@ -332,13 +360,13 @@
   const guardedReturn = async (why='auto') => {
     if (ACTIVE_ONLY && !isActive()) return false;
     if (Date.now() < suppressUntil) return false;
-
     const ready = await pingReady();
     if (!ready) {
       backoffAttempts++;
       const delay = calcBackoff();
       dbg('Server not ready, backoff ms=', delay);
-      announceSuppress();
+      // подавить соседние вкладки на окно ожидания
+      bus && bus.postMessage({ type:'suppress', ts: Date.now() });
       await sleep(delay);
       return false;
     }
