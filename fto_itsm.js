@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      2.0
+// @version      2.1
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -21,7 +21,7 @@
 
   // ===== Config =====
   const DEBUG = false;
-  const ACTIVE_ONLY  = true;                 // полноценный tryReturn — только в активной вкладке
+  const ACTIVE_ONLY  = true;
   const SUPPRESS_MS  = 25000;
   const WATCHDOG_MS  = 7000;
   const LAST_TTL_MS  = 24*60*60*1000;
@@ -29,9 +29,12 @@
   const AUTOREFRESH_GRACE_MS = 12000;
   const NET_ACTIVITY_WINDOW_MS = 5000;
 
-  // Пассивное удержание маршрута в неактивных вкладках
-  const PASSIVE_RETAIN_COOLDOWN_MS = 15000;  // минимальный интервал между пассивными переходами
-  const PASSIVE_DEGRADE = false;             // true -> в холодные 5 мин неактивная вкладка переводится на список вместо карточки
+  // Пассивное удержание (неактивные вкладки)
+  const PASSIVE_RETAIN_COOLDOWN_MS = 20000;
+  const PASSIVE_DEGRADE = false;
+  const PASSIVE_VERIFY_1_MS = 2500;
+  const PASSIVE_VERIFY_2_MS = 9000;
+  const PASSIVE_MARK_KEY = 'assyst_passive_nav';
 
   // ===== Keys / channel =====
   const KEY_LAST_OBJ = 'assyst_last_obj';
@@ -40,33 +43,38 @@
   const LOCK_KEY     = 'assyst_return_lock';
   const BUS_NAME     = 'assyst_ar_bus';
 
-  // ===== Utils =====
+  // ===== Console log helpers =====
   const TAG='[AssystAR]';
-  const info=(...a)=>DEBUG&&console.info(TAG,...a);
-  const warn=(...a)=>DEBUG&&console.warn(TAG,...a);
-  const dbg=(...a)=>DEBUG&&console.debug&&console.debug(TAG,...a);
+  const L = {
+    dec: (m,c={})=>console.info(`${TAG} ${m}`,c),
+    skip:(m,c={})=>console.warn(`${TAG} SKIP: ${m}`,c),
+    bus: (t,c={})=>console.info(`${TAG} BUS: ${t}`,c),
+    lok: (t,c={})=>console.info(`${TAG} LOCK: ${t}`,c),
+    pas: (t,c={})=>console.info(`${TAG} PASSIVE: ${t}`,c),
+    wd:  (t,c={})=>console.info(`${TAG} WD: ${t}`,c),
+    wel: (t,c={})=>console.info(`${TAG} WELCOME: ${t}`,c),
+    tr:  (t,c={})=>console.info(`${TAG} TRACE: ${t}`,c),
+  };
   const nowMs=()=>Date.now();
-  const fmtMs=(v)=>{let x=Math.max(0,v|0);const s=Math.floor(x/1000);const m=Math.floor(s/60);const h=Math.floor(m/60);const ss=(s%60).toString().padStart(2,'0');const mm=(m%60).toString().padStart(2,'0');return h?`${h}:${mm}:${ss}`:`${m}:${ss}`;};
+  const fmtMs=(v)=>{let x=Math.max(0,v|0);const s=Math.floor(x/1000),m=Math.floor(s/60),h=Math.floor(m/60);const ss=(s%60).toString().padStart(2,'0'),mm=(m%60).toString().padStart(2,'0');return h?`${h}:${mm}:${ss}`:`${m}:${ss}`;};
 
   // ===== Stable tab id =====
   let TAB_ID = sessionStorage.getItem(TAB_ID_KEY);
   if (!TAB_ID){ TAB_ID = Math.random().toString(36).slice(2); sessionStorage.setItem(TAB_ID_KEY, TAB_ID); }
 
-  // ===== Trace buffer =====
-  const TRACE_MAX=20; const trace=[];
-  const pushTrace=(type, data={})=>{ trace.push({ts:nowMs(), type, data}); if(trace.length>TRACE_MAX) trace.shift(); DEBUG&&console.log(TAG,'trace',type,data); };
-
-  // ===== UI: debug badge + banner =====
+  // ===== Minimal UI badge =====
   if (DEBUG){
     const mountBadge=()=>{
       if(document.getElementById('assystar-debug-badge'))return;
       const el=document.createElement('div');
-      el.id='assystar-debug-badge';el.textContent='Debug: ON';
+      el.id='assystar-debug-badge'; el.textContent='Debug: ON';
       Object.assign(el.style,{position:'fixed',right:'8px',bottom:'8px',zIndex:2147483647,background:'rgba(255,215,0,.9)',color:'#000',padding:'2px 6px',font:'12px/16px monospace',borderRadius:'4px',boxShadow:'0 0 0 1px #0003',pointerEvents:'none'});
       document.body.appendChild(el);
     };
     if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',mountBadge,{once:true}); else mountBadge();
   }
+
+  // ===== Return banner (session) =====
   const mountReturnBanner=(txt)=>{
     const id='assystar-return-banner';
     const el=document.getElementById(id)||(()=>{
@@ -81,7 +89,8 @@
   (function showTraceOnce(){
     try{
       const raw=sessionStorage.getItem(TRACE_KEY); if(!raw)return;
-      sessionStorage.removeItem(TRACE_KEY); const t=JSON.parse(raw); pushTrace('banner_show',t);
+      sessionStorage.removeItem(TRACE_KEY); const t=JSON.parse(raw);
+      L.tr('banner_show', t);
       if(t&&t.ts) mountReturnBanner(new Date(t.ts).toLocaleString('ru-RU',{hour12:false}));
     }catch{}
   })();
@@ -104,13 +113,13 @@
   // ===== Save last =====
   let lastRankSeen=-1,lastHref=null,saveTimer=null;
   const saveLast=(why='event')=>{
-    if(/\/logout\/|sessionInvalid=true/i.test(location.href)){dbg('Skip save: logout',why);return;}
-    if(!isWorkingPage()){dbg('Skip save: not app.do',location.href);return;}
-    if(document.visibilityState!=='visible'){dbg('Skip save: hidden');return;}
-    if(isEventSearchPage()&&(why==='hashchange'||hadRecentNetwork())){dbg('Skip save: auto-refresh',why);return;}
+    if(/\/logout\/|sessionInvalid=true/i.test(location.href)){L.skip('save_last: logout');return;}
+    if(!isWorkingPage()){L.skip('save_last: not app.do',{href:location.href});return;}
+    if(document.visibilityState!=='visible'){L.skip('save_last: hidden');return;}
+    if(isEventSearchPage()&&(why==='hashchange'||hadRecentNetwork())){L.skip('save_last: auto-refresh',{why});return;}
     const href=canonicalize(location.href); const r=routeRank(href);
     if(r<=0||href===lastHref||r<lastRankSeen) return; lastRankSeen=r; lastHref=href;
-    clearTimeout(saveTimer); saveTimer=setTimeout(()=>{ const obj={href,ts:nowMs(),rank:r}; localStorage.setItem(KEY_LAST_OBJ,JSON.stringify(obj)); sessionStorage.setItem(KEY_LAST_OBJ,JSON.stringify(obj)); pushTrace('save_last',{why,href,rank:r}); info('Saved last:',{href:obj.href,rank:obj.rank,at:new Date(obj.ts).toLocaleString('ru-RU')},'why=',why); },200);
+    clearTimeout(saveTimer); saveTimer=setTimeout(()=>{ const obj={href,ts:nowMs(),rank:r}; localStorage.setItem(KEY_LAST_OBJ,JSON.stringify(obj)); sessionStorage.setItem(KEY_LAST_OBJ,JSON.stringify(obj)); L.dec('save_last',{why,href,rank:r,at:new Date(obj.ts).toLocaleTimeString('ru-RU',{hour12:false})}); },200);
   };
   ['load','popstate','hashchange','click','keydown','visibilitychange'].forEach(ev=>addEventListener(ev,()=>saveLast(ev),{passive:true}));
   saveLast('bootstrap');
@@ -120,83 +129,89 @@
   const routeFromHash=()=>{ if(!location.hash||location.hash.length<=1)return null; try{ const dec=decodeURIComponent(location.hash.slice(1)); if(!/^[-_a-zA-Z0-9/%?=&.]+$/.test(dec)) return null; return location.origin+'/assystweb/application.do#'+dec; }catch{return null;} };
 
   // Auto-click
-  const clickReturnButton=()=>{ const attempt=()=>{ const btn=[...document.querySelectorAll('a,button')].find(n=>/вернуться в сервисдеск|войти|login/i.test(n.textContent||'')); if(btn){ pushTrace('click_return_btn'); info('Click fallback button'); btn.click(); return true; } return false; }; if(attempt())return; const mo=new MutationObserver(()=>{ if(attempt()) mo.disconnect(); }); mo.observe(document.documentElement,{childList:true,subtree:true}); };
+  const clickReturnButton=()=>{ const attempt=()=>{ const btn=[...document.querySelectorAll('a,button')].find(n=>/вернуться в сервисдеск|войти|login/i.test(n.textContent||'')); if(btn){ L.dec('click_return_btn'); btn.click(); return true; } return false; };
+    if(attempt())return; const mo=new MutationObserver(()=>{ if(attempt()) mo.disconnect(); }); mo.observe(document.documentElement,{childList:true,subtree:true}); };
 
   // Active tab
   const isActive=()=>document.visibilityState==='visible' && document.hasFocus && document.hasFocus();
 
-  // ===== Inter-tab suppression / lock + TIME SAFETY + block markers =====
+  // ===== Inter-tab suppression / lock (time-safe) =====
   const bus=('BroadcastChannel' in window)? new BroadcastChannel(BUS_NAME):null;
   let suppressUntil=0; let lastSuppressTs=0; let busMsgCount=0;
   let lastBlockAt = 0; let blocksCount = 0;
 
-  // Пассивное удержание маршрута
+  const addCacheBusterToHash=(href)=>{ try{ const [base,hash='']=href.split('#'); if(!hash) return href; const qi=hash.indexOf('?'); return qi===-1? `${base}#${hash}?_r=${nowMs()}` : `${base}#${hash}&_r=${nowMs()}`; }catch{return href;} };
+
+  // Пассивное удержание для неактивных вкладок
   let lastPassiveAt = 0;
   const passiveRetain = (reason='bus_or_storage') => {
-    if (document.visibilityState === 'visible') return;                // только для неактивной вкладки
-    const last = readLast();
-    if (!last || !last.href) return;
-    // Не понижать карточку, если не включен PASSIVE_DEGRADE
-    let target = last.href;
+    if (document.visibilityState === 'visible') return;
+    const last = readLast(); if (!last || !last.href) return;
+    if ((nowMs() - last.ts) > LAST_TTL_MS) return;
+
     const boot = Number(sessionStorage.getItem('assyst_session_boot')||nowMs());
     const cold = (nowMs()-boot) < COLD_START_DOWNGRADE_MS;
-    if (PASSIVE_DEGRADE && cold && /#event\/DisplayEvent\.do\b/i.test(target)) {
-      target = toSearchBase();
-    }
-    // Не делать частые одинаковые переходы
-    const different = canonicalize(location.href) !== canonicalize(target);
+    let target = last.href;
+    if (PASSIVE_DEGRADE && cold && /#event\/DisplayEvent\.do\b/i.test(target)) target = toSearchBase();
+
+    const busted = addCacheBusterToHash(target);
     const cooldown  = (nowMs() - lastPassiveAt) < PASSIVE_RETAIN_COOLDOWN_MS;
-    if (!different || cooldown) return;
+    if (cooldown) return;
+
     lastPassiveAt = nowMs();
-    pushTrace('passive_retain', { reason, target });
-    info('Passive retain (inactive tab) ->', target);
-    // Никаких bus/lock: просто локальная навигация
-    location.replace(target);
+    try { sessionStorage.setItem(PASSIVE_MARK_KEY, JSON.stringify({ ts: lastPassiveAt, target })); } catch {}
+    L.pas('retain', { reason, target: busted });
+    location.replace(busted);
   };
 
   bus && (bus.onmessage=(e)=>{ 
     if(e?.data?.type==='returned'||e?.data?.type==='suppress'){ 
       const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS);
       suppressUntil=safeSup; lastSuppressTs=nowMs(); busMsgCount++;
-      lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('bus_msg',e.data); pushTrace('blocked_mark',{at:lastBlockAt,origin:'bus'});
-      passiveRetain('bus'); // удержать маршрут в неактивной вкладке
+      lastBlockAt = lastSuppressTs; blocksCount++; L.bus('suppress', { ts: e?.data?.ts }); 
+      passiveRetain('bus');
     } 
   });
-  const announceSuppress=()=>{ bus && bus.postMessage({type:'suppress',ts:nowMs()}); pushTrace('suppress_broadcast'); };
+  const announceSuppress=()=>{ bus && bus.postMessage({type:'suppress',ts:nowMs()}); L.bus('announce_suppress'); };
 
   const lockAcquire=()=>{ const t=nowMs(); let lock=null; try{ lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); }catch{}
-    if(lock && (t-lock.ts) > 4*SUPPRESS_MS){ localStorage.removeItem(LOCK_KEY); pushTrace('lock_autofix',{staleMs:t-lock.ts}); lock=null; }
-    if(lock && t-lock.ts < SUPPRESS_MS){ if(lock.tabId!==TAB_ID){ lastBlockAt=t; blocksCount++; pushTrace('blocked_mark',{at:t,origin:'lock'}); } return lock.tabId===TAB_ID; }
-    localStorage.setItem(LOCK_KEY,JSON.stringify({tabId:TAB_ID,ts:t})); pushTrace('lock_acquire',{tabId:TAB_ID}); return true; };
-  const lockRelease=()=>{ try{ const lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); if(!lock || lock.tabId===TAB_ID) localStorage.removeItem(LOCK_KEY); pushTrace('lock_release',{own:!lock||lock.tabId===TAB_ID}); }catch{} };
-  addEventListener('storage',(e)=>{ if(e.key===LOCK_KEY && e.newValue){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('storage_lock',{value:e.newValue}); pushTrace('blocked_mark',{at:lastBlockAt,origin:'storage'}); passiveRetain('storage'); } });
+    if(lock && (t-lock.ts) > 4*SUPPRESS_MS){ localStorage.removeItem(LOCK_KEY); L.lok('autofix',{stale_ms:t-lock.ts}); lock=null; }
+    if(lock && t-lock.ts < SUPPRESS_MS){ if(lock.tabId!==TAB_ID){ lastBlockAt=t; blocksCount++; L.lok('blocked_by_other',{owner:lock.tabId,age_ms:t-lock.ts}); } return lock.tabId===TAB_ID; }
+    localStorage.setItem(LOCK_KEY,JSON.stringify({tabId:TAB_ID,ts:t})); L.lok('acquire',{tabId:TAB_ID}); return true; };
+  const lockRelease=()=>{ try{ const lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); if(!lock || lock.tabId===TAB_ID) localStorage.removeItem(LOCK_KEY); L.lok('release',{own:!lock||lock.tabId===TAB_ID}); }catch{} };
+  addEventListener('storage',(e)=>{ if(e.key===LOCK_KEY && e.newValue){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); lastBlockAt = lastSuppressTs; blocksCount++; L.lok('storage_event',{value:e.newValue}); passiveRetain('storage'); } });
 
   // ===== Watchdog =====
   const pageLooksBlank=()=>{ const b=document.body; if(!b) return true; const child=b.children.length; const txt=(b.textContent||'').trim().length; return child<3 && txt<40; };
-  const addCacheBusterToHash=(href)=>{ try{ const [base,hash='']=href.split('#'); if(!hash) return href; const qi=hash.indexOf('?'); return qi===-1? `${base}#${hash}?_r=${nowMs()}` : `${base}#${hash}&_r=${nowMs()}`; }catch{return href;} };
   let nextWatchdogAt=0; let lastWatchdogAction=null;
-  const scheduleWatchdog=()=>{ if(!isWorkingPage()) return; const delay = isEventSearchPage()? (WATCHDOG_MS+AUTOREFRESH_GRACE_MS): WATCHDOG_MS; nextWatchdogAt = nowMs()+delay; pushTrace('watchdog_scheduled',{at:nextWatchdogAt,delay});
-    setTimeout(()=>{ if(isEventSearchPage() && (hadRecentNetwork()||hasAutoRefreshUI()||hasListContent())){ pushTrace('watchdog_skip','auto-refresh'); return; } if(!pageLooksBlank()){ pushTrace('watchdog_ok'); return; }
-      const target = addCacheBusterToHash(location.href) || toSearchBase(); lastWatchdogAction = {ts: nowMs(), target}; pushTrace('watchdog_reload',lastWatchdogAction); info('Watchdog reload ->',target); location.replace(target);
+  const scheduleWatchdog=()=>{ if(!isWorkingPage()) return; const delay = isEventSearchPage()? (WATCHDOG_MS+AUTOREFRESH_GRACE_MS): WATCHDOG_MS; nextWatchdogAt = nowMs()+delay; L.wd('scheduled',{at:nextWatchdogAt,delay});
+    setTimeout(()=>{ if(isEventSearchPage() && (hadRecentNetwork()||hasAutoRefreshUI()||hasListContent())){ L.wd('skip_auto_refresh'); return; } if(!pageLooksBlank()){ L.wd('ok_dom_non_blank'); return; }
+      const target = addCacheBusterToHash(location.href) || toSearchBase(); lastWatchdogAction = {ts: nowMs(), target}; L.wd('reload',{target}); location.replace(target);
     }, delay); };
+
+  // ===== Passive landing verification =====
+  (function verifyPassiveLanding(){
+    let mark = null; try { mark = JSON.parse(sessionStorage.getItem(PASSIVE_MARK_KEY) || 'null'); } catch {}
+    if (!mark) return; sessionStorage.removeItem(PASSIVE_MARK_KEY);
+    const recent = (nowMs() - (mark.ts||0)) <= 60*1000; if (!recent) return;
+
+    setTimeout(() => { if (pageLooksBlank()) { const burst = addCacheBusterToHash(mark.target || location.href); L.pas('verify_reload',{target:burst}); location.replace(burst); } }, PASSIVE_VERIFY_1_MS);
+    setTimeout(() => { if (pageLooksBlank()) { const safe = toSearchBase(); L.pas('verify_fallback',{target:safe}); location.replace(safe); } }, PASSIVE_VERIFY_2_MS);
+  })();
 
   // ===== Gentle re-navigate from welcome after 500 =====
   let lastHttp500At = 0;
-  addEventListener('error', (e) => { try { if (String(e?.message||'').includes('500') || String(e?.filename||'').includes('WelcomeDispatchAction')) { lastHttp500At = nowMs(); pushTrace('http_500_hint', { ts: lastHttp500At }); } } catch {} }, true);
+  addEventListener('error', (e) => { try { if (String(e?.message||'').includes('500') || String(e?.filename||'').includes('WelcomeDispatchAction')) { lastHttp500At = nowMs(); L.wel('500_hint',{ts:lastHttp500At}); } } catch {} }, true);
   const gentleReNavigate = () => {
-    const last = readLast();
-    if (!last || !last.href) return;
-    const rankOk = last.rank >= 2;
-    const ageOk  = (nowMs() - last.ts) <= LAST_TTL_MS;
+    const last = readLast(); if (!last || !last.href) return;
+    const rankOk = last.rank >= 2; const ageOk  = (nowMs() - last.ts) <= LAST_TTL_MS;
     const isWelcome = /#welcome\/WelcomeDispatchAction\.do\b/i.test(location.href);
     const recently500 = (nowMs() - lastHttp500At) <= 1500;
     if (isWelcome && rankOk && ageOk) {
       const lock = (()=>{ try { return JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); } catch { return null; }})();
       const foreignFreshLock = lock && (nowMs()-lock.ts) < SUPPRESS_MS && lock.tabId !== TAB_ID;
       if (!foreignFreshLock && (recently500 || document.visibilityState==='visible')) {
-        pushTrace('gentle_nav_from_welcome', { target: last.href, recently500 });
-        info('Gentle navigate from welcome ->', last.href);
-        location.replace(last.href);
+        L.wel('gentle_nav',{target:last.href,recently500}); location.replace(last.href);
       }
     }
   };
@@ -205,60 +220,21 @@
 
   // ===== Try return (active tab only) =====
   const tryReturn=(why='auto')=>{
-    if(ACTIVE_ONLY && !isActive()){ dbg('Skip return: not active'); return false; }
-    if(nowMs()<suppressUntil){ dbg('Skip return: suppressed'); return false; }
-    if(!lockAcquire()){ dbg('Skip return: lock held'); return false; }
+    if(ACTIVE_ONLY && !isActive()){ L.skip('not active',{visible:document.visibilityState,focus:!!(document.hasFocus&&document.hasFocus())}); return false; }
+    if(nowMs()<suppressUntil){ L.skip('suppressed',{left_ms:suppressUntil-nowMs()}); return false; }
+    if(!lockAcquire()){ L.skip('lock held'); return false; }
     const last = readLast(); const fromH = routeFromHash(); let target = last && last.href; const ageOk = last && (nowMs()-last.ts)<=LAST_TTL_MS;
     if((!target||!ageOk) && fromH) target = fromH;
     const bootKey='assyst_session_boot'; if(!sessionStorage.getItem(bootKey)) sessionStorage.setItem(bootKey,String(nowMs()));
     const cold = (nowMs()-Number(sessionStorage.getItem(bootKey)))<COLD_START_DOWNGRADE_MS;
-    if(cold && target && /#event\/DisplayEvent\.do\b/i.test(target)){ target = target.replace(/#event\/DisplayEvent\.do/i,'#eventsearch/EventSearchDelegatingDispatchAction.do'); dbg('Cold-start: downgrade to SEARCH'); }
-    if(!isAcceptable(target)){ dbg('No acceptable/stale target',{last,fromH}); lockRelease(); return false; }
+    if(cold && target && /#event\/DisplayEvent\.do\b/i.test(target)){ target = target.replace(/#event\/DisplayEvent\.do/i,'#eventsearch/EventSearchDelegatingDispatchAction.do'); L.dec('downgrade_to_search'); }
+    if(!isAcceptable(target)){ L.skip('no acceptable/stale target',{last,fromH}); lockRelease(); return false; }
     const payload={ts:nowMs(),why,target}; try{ sessionStorage.setItem(TRACE_KEY,JSON.stringify(payload)); }catch{} bus && bus.postMessage({type:'returned',ts:payload.ts}); announceSuppress();
-    pushTrace('redirect',payload); info('Redirect ->',target); location.replace(target); return true; };
+    L.dec('redirect',payload); location.replace(target); return true; };
 
   // ===== Wiring =====
   const logoutLike=/\/logout\/|sessionInvalid=true/i.test(location.href); const loginLike =/login|signin|authenticate/i.test(location.pathname);
   if(logoutLike){ if(!tryReturn('logout')){ clickReturnButton(); document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') tryReturn('visible'); }); addEventListener('focus',()=>tryReturn('focus')); } }
   if(!logoutLike && loginLike){ addEventListener('load',()=>setTimeout(()=>tryReturn('after-login'),500)); }
   addEventListener('load',scheduleWatchdog,{once:true}); document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') scheduleWatchdog(); });
-
-  // ===== Compact Debug HUD =====
-  if(DEBUG){
-    const elId=id=>document.getElementById(id);
-    const panel=()=>{ if(elId('assystar-debug-panel'))return; const el=document.createElement('div'); el.id='assystar-debug-panel'; el.setAttribute('role','status'); el.setAttribute('aria-live','polite');
-      Object.assign(el.style,{position:'fixed',right:'8px',bottom:'64px',zIndex:2147483647,background:'rgba(0,0,0,.8)',color:'#fff',padding:'6px 8px',font:'12px/16px ui-monospace,Consolas,monospace',borderRadius:'6px',boxShadow:'0 2px 8px #0008',minWidth:'320px',maxWidth:'560px',pointerEvents:'auto',whiteSpace:'normal'});
-      const expanded = sessionStorage.getItem('assystar_debug_expanded') === '1';
-      el.innerHTML = `<div style="display:flex;gap:6px;align-items:center;margin-bottom:4px"><strong style="font-weight:600">AssystAR • Debug</strong><button id="ar_toggle" style="margin-left:auto;background:#444;color:#fff;border:1px solid #666;border-radius:3px;padding:1px 6px;cursor:pointer">${expanded ? 'Свернуть' : 'Подробнее'}</button><button id="ar_close" style="background:transparent;color:#fff;border:none;cursor:pointer;font-size:14px">×</button></div><div id="ar_compact" style="display:block;line-height:1.3"></div><div id="ar_extra" style="display:${expanded?'block':'none'};margin-top:6px;border-top:1px solid #ffffff33;padding-top:6px"><div id="ar_lines" style="max-height:150px;overflow:auto"></div><div style="margin-top:4px"><div style="font-weight:600;margin-bottom:2px">trace (last ${TRACE_MAX}):</div><div id="ar_trace" style="max-height:140px;overflow:auto;border:1px solid #ffffff22;padding:4px"></div></div></div>`;
-      document.body.appendChild(el);
-      let sx=0,sy=0,ox=0,oy=0,drag=false; el.addEventListener('mousedown',(e)=>{ if((e.target.id||'').startsWith('ar_')) return; drag=true; sx=e.clientX; sy=e.clientY; ox=parseInt(el.style.right)||8; oy=parseInt(el.style.bottom)||64; el.style.cursor='grabbing'; });
-      window.addEventListener('mouseup',()=>{ drag=false; el.style.cursor='default'; }); window.addEventListener('mousemove',(e)=>{ if(!drag)return; const dx=e.clientX-sx, dy=e.clientY-sy; el.style.right=Math.max(0,ox-dx)+'px'; el.style.bottom=Math.max(0,oy-dy)+'px'; });
-      elId('ar_close').onclick = ()=> el.remove(); elId('ar_toggle').onclick = ()=>{ const ex = elId('ar_extra'); const btn=elId('ar_toggle'); const show = ex.style.display==='none'; ex.style.display = show? 'block':'none'; btn.textContent = show? 'Свернуть':'Подробнее'; sessionStorage.setItem('assystar_debug_expanded', show? '1':'0'); };
-    };
-    const upd=()=>{ const set=(id,html)=>{ const n=elId(id); if(n) n.innerHTML=html; }; const lock=(()=>{try{return JSON.parse(localStorage.getItem(LOCK_KEY)||'null');}catch{return null;}})(); const now = nowMs();
-      const vis = document.visibilityState; const foc = (document.hasFocus&&document.hasFocus())?'yes':'no'; const sup = Math.max(0, suppressUntil-now); const supS = fmtMs(sup);
-      const lockStr = lock ? `${lock.tabId.slice(0,6)} ${fmtMs(now-lock.ts)}` : '—'; const boot = Number(sessionStorage.getItem('assyst_session_boot')||now); const cold = (now-boot) < COLD_START_DOWNGRADE_MS ? 'yes':'no';
-      const page = /#eventsearch\/EventSearchDelegatingDispatchAction\.do\b/i.test(location.href)? 'eventsearch' : (/#event\/DisplayEvent\.do\b/i.test(location.href)? 'event':'other');
-      const last = (()=>{try{return JSON.parse(sessionStorage.getItem('assyst_last_obj')||localStorage.getItem('assyst_last_obj')||'null');}catch{return null;}})(); const lastRank = last? last.rank:'-';
-      const targetPreview = (last&&last.href)? (/#event\/DisplayEvent\.do\b/i.test(last.href)? 'event':'list') : '—';
-      const blockedAgo = lastBlockAt ? fmtMs(now - lastBlockAt) + ' ago' : 'no';
-      const compact = [
-        `vis: ${vis} focus: ${foc} | sup: ${supS} | lock: ${lockStr}`,
-        `blocked: ${blockedAgo} | count: ${blocksCount}`,
-        `cold: ${cold} | page: ${page} | last: rank=${lastRank} | target: ${targetPreview}`,
-        `bus: ${busMsgCount} | wd next: ${nextWatchdogAt ? (new Date(nextWatchdogAt).toLocaleTimeString('ru-RU',{hour12:false})) : '—'} | blank: ${pageLooksBlank()?'yes':'no'}`
-      ].join('<br/>');
-      set('ar_compact', compact);
-      const ex = elId('ar_extra'); if (!ex || ex.style.display==='none') return; const lines = [];
-      const lastObj = last ? `rank=${last.rank} age=${fmtMs(now-(last.ts||now))} ${last.href}` : '—';
-      lines.push(`tabId: ${TAB_ID}`); lines.push(`network: ${navigator.onLine?'online':'offline'}`); lines.push(`lastURL: ${lastObj}`);
-      lines.push(`last block at: ${lastBlockAt ? new Date(lastBlockAt).toLocaleTimeString('ru-RU',{hour12:false}) : '—'} (count=${blocksCount})`);
-      lines.push(`lock owner: ${lock? lock.tabId:'—'} age: ${lock? fmtMs(now-lock.ts):'—'}`);
-      lines.push(`boot age: ${fmtMs(now-boot)}`); lines.push(`from hash: ${location.hash&&location.hash.length>1 ? 'maybe':'no'}`);
-      set('ar_lines', lines.join('<br/>'));
-      const box = elId('ar_trace'); if (box) box.textContent = trace.map(t=>`${new Date(t.ts).toLocaleTimeString('ru-RU',{hour12:false})} • ${t.type} ${JSON.stringify(t.data)}`).join('\n');
-    };
-    const ensure=()=>{ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',panel,{once:true}); else panel(); };
-    ensure(); upd(); setInterval(upd,1000);
-  }
 })();
