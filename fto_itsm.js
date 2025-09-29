@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.8
+// @version      1.9
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -120,18 +120,20 @@
   // Active tab
   const isActive=()=>document.visibilityState==='visible' && document.hasFocus && document.hasFocus();
 
-  // Inter-tab suppression / lock + TIME SAFETY
+  // Inter-tab suppression / lock + TIME SAFETY + block markers
   const bus=('BroadcastChannel' in window)? new BroadcastChannel(BUS_NAME):null;
   let suppressUntil=0; let lastSuppressTs=0; let busMsgCount=0;
-  bus && (bus.onmessage=(e)=>{ if(e?.data?.type==='returned'||e?.data?.type==='suppress'){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); busMsgCount++; pushTrace('bus_msg',e.data); } });
+  let lastBlockAt = 0; let blocksCount = 0;
+
+  bus && (bus.onmessage=(e)=>{ if(e?.data?.type==='returned'||e?.data?.type==='suppress'){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); busMsgCount++; lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('bus_msg',e.data); pushTrace('blocked_mark',{at:lastBlockAt,origin:'bus'}); } });
   const announceSuppress=()=>{ bus && bus.postMessage({type:'suppress',ts:nowMs()}); pushTrace('suppress_broadcast'); };
 
   const lockAcquire=()=>{ const t=nowMs(); let lock=null; try{ lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); }catch{}
     if(lock && (t-lock.ts) > 4*SUPPRESS_MS){ localStorage.removeItem(LOCK_KEY); pushTrace('lock_autofix',{staleMs:t-lock.ts}); lock=null; }
-    if(lock && t-lock.ts < SUPPRESS_MS){ if(lock.tabId===TAB_ID) return true; return false; }
+    if(lock && t-lock.ts < SUPPRESS_MS){ if(lock.tabId!==TAB_ID){ lastBlockAt=t; blocksCount++; pushTrace('blocked_mark',{at:t,origin:'lock'}); } return lock.tabId===TAB_ID; }
     localStorage.setItem(LOCK_KEY,JSON.stringify({tabId:TAB_ID,ts:t})); pushTrace('lock_acquire',{tabId:TAB_ID}); return true; };
   const lockRelease=()=>{ try{ const lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); if(!lock || lock.tabId===TAB_ID) localStorage.removeItem(LOCK_KEY); pushTrace('lock_release',{own:!lock||lock.tabId===TAB_ID}); }catch{} };
-  addEventListener('storage',(e)=>{ if(e.key===LOCK_KEY && e.newValue){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); pushTrace('storage_lock',{value:e.newValue}); } });
+  addEventListener('storage',(e)=>{ if(e.key===LOCK_KEY && e.newValue){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('storage_lock',{value:e.newValue}); pushTrace('blocked_mark',{at:lastBlockAt,origin:'storage'}); } });
 
   // Watchdog
   const pageLooksBlank=()=>{ const b=document.body; if(!b) return true; const child=b.children.length; const txt=(b.textContent||'').trim().length; return child<3 && txt<40; };
@@ -142,6 +144,29 @@
     setTimeout(()=>{ if(isEventSearchPage() && (hadRecentNetwork()||hasAutoRefreshUI()||hasListContent())){ pushTrace('watchdog_skip','auto-refresh'); return; } if(!pageLooksBlank()){ pushTrace('watchdog_ok'); return; }
       const target = addCacheBusterToHash(location.href) || toSearchBase(); lastWatchdogAction = {ts: nowMs(), target}; pushTrace('watchdog_reload',lastWatchdogAction); info('Watchdog reload ->',target); location.replace(target);
     }, delay); };
+
+  // Gentle re-navigate from welcome after 500/refresh reset
+  let lastHttp500At = 0;
+  addEventListener('error', (e) => { try { if (String(e?.message||'').includes('500') || String(e?.filename||'').includes('WelcomeDispatchAction')) { lastHttp500At = nowMs(); pushTrace('http_500_hint', { ts: lastHttp500At }); } } catch {} }, true);
+  const gentleReNavigate = () => {
+    const last = readLast();
+    if (!last || !last.href) return;
+    const rankOk = last.rank >= 2;
+    const ageOk  = (nowMs() - last.ts) <= LAST_TTL_MS;
+    const isWelcome = /#welcome\/WelcomeDispatchAction\.do\b/i.test(location.href);
+    const recently500 = (nowMs() - lastHttp500At) <= 1500;
+    if (isWelcome && rankOk && ageOk) {
+      const lock = (()=>{ try { return JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); } catch { return null; }})();
+      const foreignFreshLock = lock && (nowMs()-lock.ts) < SUPPRESS_MS && lock.tabId !== TAB_ID;
+      if (!foreignFreshLock && (recently500 || document.visibilityState==='visible')) {
+        pushTrace('gentle_nav_from_welcome', { target: last.href, recently500 });
+        info('Gentle navigate from welcome ->', last.href);
+        location.replace(last.href);
+      }
+    }
+  };
+  addEventListener('load', () => setTimeout(gentleReNavigate, 800));
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') setTimeout(gentleReNavigate, 250); });
 
   // Try return
   const tryReturn=(why='auto')=>{ if(ACTIVE_ONLY && !isActive()){ dbg('Skip return: not active'); return false; } if(nowMs()<suppressUntil){ dbg('Skip return: suppressed'); return false; } if(!lockAcquire()){ dbg('Skip return: lock held'); return false; }
@@ -172,20 +197,30 @@
       window.addEventListener('mouseup',()=>{ drag=false; el.style.cursor='default'; }); window.addEventListener('mousemove',(e)=>{ if(!drag)return; const dx=e.clientX-sx, dy=e.clientY-sy; el.style.right=Math.max(0,ox-dx)+'px'; el.style.bottom=Math.max(0,oy-dy)+'px'; });
       elId('ar_close').onclick = ()=> el.remove(); elId('ar_toggle').onclick = ()=>{ const ex = elId('ar_extra'); const btn=elId('ar_toggle'); const show = ex.style.display==='none'; ex.style.display = show? 'block':'none'; btn.textContent = show? 'Свернуть':'Подробнее'; sessionStorage.setItem('assystar_debug_expanded', show? '1':'0'); };
     };
-    const upd=()=>{ const set=(id,html)=>{ const n=elId(id); if(n) n.innerHTML=html; }; const lock=(()=>{try{return JSON.parse(localStorage.getItem('assyst_return_lock')||'null');}catch{return null;}})(); const now = nowMs();
+    const upd=()=>{ const set=(id,html)=>{ const n=elId(id); if(n) n.innerHTML=html; }; const lock=(()=>{try{return JSON.parse(localStorage.getItem(LOCK_KEY)||'null');}catch{return null;}})(); const now = nowMs();
       const vis = document.visibilityState; const foc = (document.hasFocus&&document.hasFocus())?'yes':'no'; const sup = Math.max(0, suppressUntil-now); const supS = fmtMs(sup);
       const lockStr = lock ? `${lock.tabId.slice(0,6)} ${fmtMs(now-lock.ts)}` : '—'; const boot = Number(sessionStorage.getItem('assyst_session_boot')||now); const cold = (now-boot) < COLD_START_DOWNGRADE_MS ? 'yes':'no';
       const page = /#eventsearch\/EventSearchDelegatingDispatchAction\.do\b/i.test(location.href)? 'eventsearch' : (/#event\/DisplayEvent\.do\b/i.test(location.href)? 'event':'other');
       const last = (()=>{try{return JSON.parse(sessionStorage.getItem('assyst_last_obj')||localStorage.getItem('assyst_last_obj')||'null');}catch{return null;}})(); const lastRank = last? last.rank:'-';
       const targetPreview = (last&&last.href)? (/#event\/DisplayEvent\.do\b/i.test(last.href)? 'event':'list') : '—';
-      const compact = [ `vis: ${vis} focus: ${foc} | sup: ${supS} | lock: ${lockStr}`, `cold: ${cold} | page: ${page} | last: rank=${lastRank} | target: ${targetPreview}`, `bus: ${busMsgCount} | wd next: ${nextWatchdogAt ? (new Date(nextWatchdogAt).toLocaleTimeString('ru-RU',{hour12:false})) : '—'} | blank: ${pageLooksBlank()?'yes':'no'}` ].join('<br/>');
+      const blockedAgo = lastBlockAt ? fmtMs(now - lastBlockAt) + ' ago' : 'no';
+      const compact = [
+        `vis: ${vis} focus: ${foc} | sup: ${supS} | lock: ${lockStr}`,
+        `blocked: ${blockedAgo} | count: ${blocksCount}`,
+        `cold: ${cold} | page: ${page} | last: rank=${lastRank} | target: ${targetPreview}`,
+        `bus: ${busMsgCount} | wd next: ${nextWatchdogAt ? (new Date(nextWatchdogAt).toLocaleTimeString('ru-RU',{hour12:false})) : '—'} | blank: ${pageLooksBlank()?'yes':'no'}`
+      ].join('<br/>');
       set('ar_compact', compact);
       const ex = elId('ar_extra'); if (!ex || ex.style.display==='none') return; const lines = [];
       const lastObj = last ? `rank=${last.rank} age=${fmtMs(now-(last.ts||now))} ${last.href}` : '—';
-      lines.push(`tabId: ${sessionStorage.getItem('assyst_tab_id')||'—'}`); lines.push(`network: ${navigator.onLine?'online':'offline'}`); lines.push(`lastURL: ${lastObj}`);
-      lines.push(`lock owner: ${lock? lock.tabId:'—'} age: ${lock? fmtMs(now-lock.ts):'—'}`); lines.push(`boot age: ${fmtMs(now-boot)}`); lines.push(`from hash: ${location.hash&&location.hash.length>1 ? 'maybe':'no'}`);
-      set('ar_lines', lines.join('<br/>')); const box = elId('ar_trace'); if (box) box.textContent = trace.map(t=>`${new Date(t.ts).toLocaleTimeString('ru-RU',{hour12:false})} • ${t.type} ${JSON.stringify(t.data)}`).join('\n');
+      lines.push(`tabId: ${TAB_ID}`); lines.push(`network: ${navigator.onLine?'online':'offline'}`); lines.push(`lastURL: ${lastObj}`);
+      lines.push(`last block at: ${lastBlockAt ? new Date(lastBlockAt).toLocaleTimeString('ru-RU',{hour12:false}) : '—'} (count=${blocksCount})`);
+      lines.push(`lock owner: ${lock? lock.tabId:'—'} age: ${lock? fmtMs(now-lock.ts):'—'}`);
+      lines.push(`boot age: ${fmtMs(now-boot)}`); lines.push(`from hash: ${location.hash&&location.hash.length>1 ? 'maybe':'no'}`);
+      set('ar_lines', lines.join('<br/>'));
+      const box = elId('ar_trace'); if (box) box.textContent = trace.map(t=>`${new Date(t.ts).toLocaleTimeString('ru-RU',{hour12:false})} • ${t.type} ${JSON.stringify(t.data)}`).join('\n');
     };
-    const ensure=()=>{ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',panel,{once:true}); else panel(); }; ensure(); upd(); setInterval(upd,1000);
+    const ensure=()=>{ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded',panel,{once:true}); else panel(); };
+    ensure(); upd(); setInterval(upd,1000);
   }
 })();
