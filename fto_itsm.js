@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Assyst Auto-Return ITSM
 // @namespace    https://github.com/kodxuk/tampermonkey
-// @version      1.9
+// @version      2.0
 // @updateURL    https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @downloadURL  https://raw.githubusercontent.com/kodxuk/tampermonkey/refs/heads/main/fto_itsm.js
 // @description  Надёжный автоворзват: активная вкладка, межвкладочный lock, офлайн-гейтинг, холодный старт-деградация, fallback из хэша, автоклик, watchdog, постоянные бейдж/баннер (session)
@@ -21,13 +21,17 @@
 
   // ===== Config =====
   const DEBUG = false;
-  const ACTIVE_ONLY  = true;
+  const ACTIVE_ONLY  = true;                 // полноценный tryReturn — только в активной вкладке
   const SUPPRESS_MS  = 25000;
   const WATCHDOG_MS  = 7000;
   const LAST_TTL_MS  = 24*60*60*1000;
   const COLD_START_DOWNGRADE_MS = 5*60*1000;
   const AUTOREFRESH_GRACE_MS = 12000;
   const NET_ACTIVITY_WINDOW_MS = 5000;
+
+  // Пассивное удержание маршрута в неактивных вкладках
+  const PASSIVE_RETAIN_COOLDOWN_MS = 15000;  // минимальный интервал между пассивными переходами
+  const PASSIVE_DEGRADE = false;             // true -> в холодные 5 мин неактивная вкладка переводится на список вместо карточки
 
   // ===== Keys / channel =====
   const KEY_LAST_OBJ = 'assyst_last_obj';
@@ -89,6 +93,7 @@
   const isWorkingPage=()=>/\/assystweb\/application\.do$/i.test(location.pathname)&&location.hash.length>1;
   const routeRank=(href)=>{ const h=canonicalize(href); if(ROUTE.EVENT.test(h))return 3; if(ROUTE.SEARCH.test(h))return 2; if(ROUTE.WELCOME.test(h))return 0; return 1; };
   const isAcceptable=(u)=>u&&u.startsWith(location.origin)&&/\/assystweb\/application\.do#/i.test(u);
+  const toSearchBase=()=>location.origin+'/assystweb/application.do#eventsearch/EventSearchDelegatingDispatchAction.do?dispatch=loadQuery';
 
   // Auto-refresh heuristics
   const isEventSearchPage=()=>/#eventsearch\/EventSearchDelegatingDispatchAction\.do\b/i.test(location.href);
@@ -120,12 +125,43 @@
   // Active tab
   const isActive=()=>document.visibilityState==='visible' && document.hasFocus && document.hasFocus();
 
-  // Inter-tab suppression / lock + TIME SAFETY + block markers
+  // ===== Inter-tab suppression / lock + TIME SAFETY + block markers =====
   const bus=('BroadcastChannel' in window)? new BroadcastChannel(BUS_NAME):null;
   let suppressUntil=0; let lastSuppressTs=0; let busMsgCount=0;
   let lastBlockAt = 0; let blocksCount = 0;
 
-  bus && (bus.onmessage=(e)=>{ if(e?.data?.type==='returned'||e?.data?.type==='suppress'){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); busMsgCount++; lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('bus_msg',e.data); pushTrace('blocked_mark',{at:lastBlockAt,origin:'bus'}); } });
+  // Пассивное удержание маршрута
+  let lastPassiveAt = 0;
+  const passiveRetain = (reason='bus_or_storage') => {
+    if (document.visibilityState === 'visible') return;                // только для неактивной вкладки
+    const last = readLast();
+    if (!last || !last.href) return;
+    // Не понижать карточку, если не включен PASSIVE_DEGRADE
+    let target = last.href;
+    const boot = Number(sessionStorage.getItem('assyst_session_boot')||nowMs());
+    const cold = (nowMs()-boot) < COLD_START_DOWNGRADE_MS;
+    if (PASSIVE_DEGRADE && cold && /#event\/DisplayEvent\.do\b/i.test(target)) {
+      target = toSearchBase();
+    }
+    // Не делать частые одинаковые переходы
+    const different = canonicalize(location.href) !== canonicalize(target);
+    const cooldown  = (nowMs() - lastPassiveAt) < PASSIVE_RETAIN_COOLDOWN_MS;
+    if (!different || cooldown) return;
+    lastPassiveAt = nowMs();
+    pushTrace('passive_retain', { reason, target });
+    info('Passive retain (inactive tab) ->', target);
+    // Никаких bus/lock: просто локальная навигация
+    location.replace(target);
+  };
+
+  bus && (bus.onmessage=(e)=>{ 
+    if(e?.data?.type==='returned'||e?.data?.type==='suppress'){ 
+      const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS);
+      suppressUntil=safeSup; lastSuppressTs=nowMs(); busMsgCount++;
+      lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('bus_msg',e.data); pushTrace('blocked_mark',{at:lastBlockAt,origin:'bus'});
+      passiveRetain('bus'); // удержать маршрут в неактивной вкладке
+    } 
+  });
   const announceSuppress=()=>{ bus && bus.postMessage({type:'suppress',ts:nowMs()}); pushTrace('suppress_broadcast'); };
 
   const lockAcquire=()=>{ const t=nowMs(); let lock=null; try{ lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); }catch{}
@@ -133,19 +169,18 @@
     if(lock && t-lock.ts < SUPPRESS_MS){ if(lock.tabId!==TAB_ID){ lastBlockAt=t; blocksCount++; pushTrace('blocked_mark',{at:t,origin:'lock'}); } return lock.tabId===TAB_ID; }
     localStorage.setItem(LOCK_KEY,JSON.stringify({tabId:TAB_ID,ts:t})); pushTrace('lock_acquire',{tabId:TAB_ID}); return true; };
   const lockRelease=()=>{ try{ const lock=JSON.parse(localStorage.getItem(LOCK_KEY)||'null'); if(!lock || lock.tabId===TAB_ID) localStorage.removeItem(LOCK_KEY); pushTrace('lock_release',{own:!lock||lock.tabId===TAB_ID}); }catch{} };
-  addEventListener('storage',(e)=>{ if(e.key===LOCK_KEY && e.newValue){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('storage_lock',{value:e.newValue}); pushTrace('blocked_mark',{at:lastBlockAt,origin:'storage'}); } });
+  addEventListener('storage',(e)=>{ if(e.key===LOCK_KEY && e.newValue){ const safeSup = Math.min(nowMs()+SUPPRESS_MS, nowMs()+2*SUPPRESS_MS); suppressUntil=safeSup; lastSuppressTs=nowMs(); lastBlockAt = lastSuppressTs; blocksCount++; pushTrace('storage_lock',{value:e.newValue}); pushTrace('blocked_mark',{at:lastBlockAt,origin:'storage'}); passiveRetain('storage'); } });
 
-  // Watchdog
+  // ===== Watchdog =====
   const pageLooksBlank=()=>{ const b=document.body; if(!b) return true; const child=b.children.length; const txt=(b.textContent||'').trim().length; return child<3 && txt<40; };
   const addCacheBusterToHash=(href)=>{ try{ const [base,hash='']=href.split('#'); if(!hash) return href; const qi=hash.indexOf('?'); return qi===-1? `${base}#${hash}?_r=${nowMs()}` : `${base}#${hash}&_r=${nowMs()}`; }catch{return href;} };
-  const toSearchBase=()=>location.origin+'/assystweb/application.do#eventsearch/EventSearchDelegatingDispatchAction.do?dispatch=loadQuery';
   let nextWatchdogAt=0; let lastWatchdogAction=null;
   const scheduleWatchdog=()=>{ if(!isWorkingPage()) return; const delay = isEventSearchPage()? (WATCHDOG_MS+AUTOREFRESH_GRACE_MS): WATCHDOG_MS; nextWatchdogAt = nowMs()+delay; pushTrace('watchdog_scheduled',{at:nextWatchdogAt,delay});
     setTimeout(()=>{ if(isEventSearchPage() && (hadRecentNetwork()||hasAutoRefreshUI()||hasListContent())){ pushTrace('watchdog_skip','auto-refresh'); return; } if(!pageLooksBlank()){ pushTrace('watchdog_ok'); return; }
       const target = addCacheBusterToHash(location.href) || toSearchBase(); lastWatchdogAction = {ts: nowMs(), target}; pushTrace('watchdog_reload',lastWatchdogAction); info('Watchdog reload ->',target); location.replace(target);
     }, delay); };
 
-  // Gentle re-navigate from welcome after 500/refresh reset
+  // ===== Gentle re-navigate from welcome after 500 =====
   let lastHttp500At = 0;
   addEventListener('error', (e) => { try { if (String(e?.message||'').includes('500') || String(e?.filename||'').includes('WelcomeDispatchAction')) { lastHttp500At = nowMs(); pushTrace('http_500_hint', { ts: lastHttp500At }); } } catch {} }, true);
   const gentleReNavigate = () => {
@@ -168,8 +203,11 @@
   addEventListener('load', () => setTimeout(gentleReNavigate, 800));
   document.addEventListener('visibilitychange', () => { if (document.visibilityState==='visible') setTimeout(gentleReNavigate, 250); });
 
-  // Try return
-  const tryReturn=(why='auto')=>{ if(ACTIVE_ONLY && !isActive()){ dbg('Skip return: not active'); return false; } if(nowMs()<suppressUntil){ dbg('Skip return: suppressed'); return false; } if(!lockAcquire()){ dbg('Skip return: lock held'); return false; }
+  // ===== Try return (active tab only) =====
+  const tryReturn=(why='auto')=>{
+    if(ACTIVE_ONLY && !isActive()){ dbg('Skip return: not active'); return false; }
+    if(nowMs()<suppressUntil){ dbg('Skip return: suppressed'); return false; }
+    if(!lockAcquire()){ dbg('Skip return: lock held'); return false; }
     const last = readLast(); const fromH = routeFromHash(); let target = last && last.href; const ageOk = last && (nowMs()-last.ts)<=LAST_TTL_MS;
     if((!target||!ageOk) && fromH) target = fromH;
     const bootKey='assyst_session_boot'; if(!sessionStorage.getItem(bootKey)) sessionStorage.setItem(bootKey,String(nowMs()));
@@ -179,7 +217,7 @@
     const payload={ts:nowMs(),why,target}; try{ sessionStorage.setItem(TRACE_KEY,JSON.stringify(payload)); }catch{} bus && bus.postMessage({type:'returned',ts:payload.ts}); announceSuppress();
     pushTrace('redirect',payload); info('Redirect ->',target); location.replace(target); return true; };
 
-  // Wiring
+  // ===== Wiring =====
   const logoutLike=/\/logout\/|sessionInvalid=true/i.test(location.href); const loginLike =/login|signin|authenticate/i.test(location.pathname);
   if(logoutLike){ if(!tryReturn('logout')){ clickReturnButton(); document.addEventListener('visibilitychange',()=>{ if(document.visibilityState==='visible') tryReturn('visible'); }); addEventListener('focus',()=>tryReturn('focus')); } }
   if(!logoutLike && loginLike){ addEventListener('load',()=>setTimeout(()=>tryReturn('after-login'),500)); }
